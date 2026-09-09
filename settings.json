@@ -1,0 +1,10 @@
+{
+  "alert_volume": 0.4076655052264808,
+  "alarm_volume": 1.0,
+  "voice_enabled": true,
+  "visual_alerts_enabled": true,
+  "sound_enabled": true,
+  "alert_sound": "soft_beep_2",
+  "warning_sound": "warning_2",
+  "drowsy_sound": "strong_alarm_2"
+}

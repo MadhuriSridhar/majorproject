@@ -1,0 +1,16 @@
+{
+  "enabled": [
+    "blink_count",
+    "blink_rate",
+    "camera_fps",
+    "camera_status",
+    "current_time",
+    "driving_duration",
+    "eye_closure",
+    "eye_monitoring",
+    "fatigue_risk",
+    "night_context",
+    "yawn_count",
+    "yawn_frequency"
+  ]
+}
