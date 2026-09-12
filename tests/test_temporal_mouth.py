@@ -115,5 +115,24 @@ class ConfigTests(unittest.TestCase):
         self.assertAlmostEqual(YAWN_MIN_DURATION_S, 1.20)
 
 
+class ColdStartYawnRateTests(unittest.TestCase):
+    def _yawn(self, tracker, start: float) -> None:
+        tracker.update(0.20, start - 0.05)
+        t = start
+        while t < start + YAWN_MIN_DURATION_S + 0.2:
+            tracker.update(0.80, t)
+            t += 0.10
+        tracker.update(0.20, start + YAWN_MIN_DURATION_S + 0.3)
+
+    def test_rate_uses_elapsed_time_during_first_minute(self) -> None:
+        tracker = YawnTracker()
+        tracker.update(0.20, 0.0)  # marks monitoring start
+        self._yawn(tracker, start=5.0)
+        self._yawn(tracker, start=15.0)
+        state = tracker.update(0.20, 30.0)
+        # (2 yawns / 30s) * 60 = 4.0, not (2 / 60) * 60 = 2.0.
+        self.assertAlmostEqual(state.yawn_frequency, 4.0, places=4)
+
+
 if __name__ == "__main__":
     unittest.main()

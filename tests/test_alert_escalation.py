@@ -60,7 +60,7 @@ class AlertEntryTests(unittest.TestCase):
 
 class CooldownTests(unittest.TestCase):
     def test_low_fatigue_cooldown_blocks_repeat(self) -> None:
-        ctl = AlertEscalationController(low_fatigue_cooldown_s=10.0)
+        ctl = AlertEscalationController(low_fatigue_cooldown_s=10.0, episode_recovery_s=0.0, episode_cooldown_s=0.0)
         ctl.update("LOW_FATIGUE", 0.0)
         # Recover then re-enter before cooldown.
         ctl.update("NORMAL", 1.0)
@@ -68,14 +68,14 @@ class CooldownTests(unittest.TestCase):
         self.assertFalse(r.should_play_audio)  # cooldown not elapsed
 
     def test_low_fatigue_cooldown_allows_after_elapsed(self) -> None:
-        ctl = AlertEscalationController(low_fatigue_cooldown_s=10.0)
+        ctl = AlertEscalationController(low_fatigue_cooldown_s=10.0, episode_recovery_s=0.0, episode_cooldown_s=0.0)
         ctl.update("LOW_FATIGUE", 0.0)
         ctl.update("NORMAL", 1.0)
         r = ctl.update("LOW_FATIGUE", 11.0)
         self.assertTrue(r.should_play_audio)
 
     def test_warning_cooldown(self) -> None:
-        ctl = AlertEscalationController(warning_cooldown_s=10.0)
+        ctl = AlertEscalationController(warning_cooldown_s=10.0, episode_recovery_s=0.0, episode_cooldown_s=0.0)
         ctl.update("WARNING", 0.0)
         ctl.update("NORMAL", 1.0)
         r = ctl.update("WARNING", 5.0)
@@ -86,7 +86,7 @@ class CooldownTests(unittest.TestCase):
         self.assertTrue(r2.should_play_audio)
 
     def test_drowsy_cooldown(self) -> None:
-        ctl = AlertEscalationController(drowsy_cooldown_s=10.0)
+        ctl = AlertEscalationController(drowsy_cooldown_s=10.0, episode_recovery_s=0.0, episode_cooldown_s=0.0)
         ctl.update("DROWSY", 0.0)
         ctl.update("NORMAL", 1.0)
         r = ctl.update("DROWSY", 5.0)
@@ -147,7 +147,7 @@ class DisplayTimerTests(unittest.TestCase):
 
 class RecoveryTests(unittest.TestCase):
     def test_recovery_resets_alert_eligibility(self) -> None:
-        ctl = AlertEscalationController(drowsy_cooldown_s=0.0)
+        ctl = AlertEscalationController(drowsy_cooldown_s=0.0, episode_recovery_s=0.0, episode_cooldown_s=0.0)
         ctl.update("DROWSY", 0.0)
         ctl.update("NORMAL", 1.0)
         r = ctl.update("DROWSY", 2.0)

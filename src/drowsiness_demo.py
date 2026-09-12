@@ -178,10 +178,26 @@ def main() -> None:
                     face_ok=True,
                 )
                 alert_result = alert_controller.update(
-                    attention.alert_severity, elapsed_s
+                    attention.alert_severity,
+                    elapsed_s,
+                    reason=attention.primary_reason,
+                    contributing_factors=(
+                        attention.distraction_primary,
+                        "fatigue" if attention.fatigue_score >= 50.0 else "stable",
+                    ),
+                    alertness_score=attention.alertness_score,
+                    fatigue_score=attention.fatigue_score,
+                    distraction_score=attention.distraction_score,
                 )
                 if alert_result.should_play_audio:
-                    audio_engine.play_alert(alert_result.audio_severity)
+                    audio_engine.play_alert(
+                        alert_result.audio_severity,
+                        reason=attention.primary_reason,
+                        contributing_factors=(
+                            attention.distraction_primary,
+                            "fatigue" if attention.fatigue_score >= 50.0 else "stable",
+                        ),
+                    )
             else:
                 fatigue_engine.reset()
                 attention_engine.reset()

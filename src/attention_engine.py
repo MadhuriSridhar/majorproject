@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from distraction_monitor import DistractionObservation
 
 # Transparent fusion weights (fatigue remains the dominant contributor).
-WEIGHT_FATIGUE = 0.62
+WEIGHT_FATIGUE = 0.90
 WEIGHT_DISTRACTION = 0.38
 
 # Soft context gains (location / weather amplify; they do not replace driver risk).
@@ -30,6 +30,19 @@ SAFE_MAX = 24
 MODERATE_MAX = 49
 HIGH_MAX = 74
 # >= HIGH_MAX+ → CRITICAL
+
+# ALERT sits inside the MODERATE band. Enter ALERT at ALERT_ENTRY, but do not
+# immediately drop back to LOW_FATIGUE just below it: use a lower exit
+# threshold (hysteresis) so LOW_FATIGUE <-> ALERT flapping is avoided.
+ALERT_ENTRY = 35.0
+ALERT_EXIT = 32.0
+
+# WARNING (HIGH) requires a short persistence before it is emitted so a
+# single-frame / very brief risk spike cannot fire a serious alarm.
+ALERT_PERSISTENCE_S = 0.75
+WARNING_PERSISTENCE_S = 1.00
+DROWSY_PERSISTENCE_S = 1.50
+RECOVERY_PERSISTENCE_S = 1.25
 
 # Asymmetric decrease (same philosophy as FatigueEngine).
 RISK_DECREASE_HOLD_S = 0.45
@@ -59,6 +72,9 @@ class AttentionDecision:
     primary_reason: str
     distraction_primary: str
     face_ok: bool
+    alertness_score: float = 100.0
+    fatigue_score: float = 0.0
+    distraction_score: float = 0.0
     location_risk: float = 0.0
     weather_risk: float = 0.0
     location_zone: str = "none"
@@ -81,16 +97,30 @@ def risk_level_from_score(score: float | None) -> str:
     return "CRITICAL"
 
 
-def fuse_raw_risk(fatigue_risk: float, distraction_risk: float) -> float:
-    """Simple transparent weighted fusion + mild dual-signal boost."""
+def _distraction_type_factor(primary: str | None, duration_s: float = 0.0) -> float:
+    """Different distraction modes carry different baseline importance."""
+    name = (primary or "").lower()
+    base = {
+        "looking_down": 1.35,
+        "head_turn_left": 0.9,
+        "head_turn_right": 0.9,
+        "passenger_side": 0.8,
+        "none": 0.0,
+    }.get(name, 0.7)
+    if duration_s > 0.0 and duration_s < 2.0:
+        base *= 0.6
+    return float(base)
+
+
+def fuse_raw_risk(fatigue_risk: float, distraction_risk: float, distraction_primary: str | None = None, distraction_duration_s: float = 0.0) -> float:
+    """Weighted fusion that still respects different distraction types and duration."""
     f = max(0.0, min(100.0, float(fatigue_risk)))
     d = max(0.0, min(100.0, float(distraction_risk)))
-    combined = WEIGHT_FATIGUE * f + WEIGHT_DISTRACTION * d
-    # Both elevated → small explainable boost (does not invent new detectors).
-    if f >= 40.0 and d >= 40.0:
+    type_factor = _distraction_type_factor(distraction_primary, distraction_duration_s)
+    d_adjusted = d * type_factor
+    combined = WEIGHT_FATIGUE * f + WEIGHT_DISTRACTION * d_adjusted
+    if f >= 40.0 and d_adjusted >= 40.0:
         combined = min(100.0, combined + 8.0)
-    # Existing fatigue (and strong distraction) must still surface fully.
-    combined = max(combined, f, d * 0.90)
     return float(min(100.0, combined))
 
 
@@ -164,6 +194,70 @@ class AttentionEngine:
         self._improve_since: float | None = None
         self._last_raw: float | None = None
         self._last_update_s: float | None = None
+        self._alert_severity = "NORMAL"
+        self._warning_pending_since: float | None = None
+        self._pending_alert_target: str | None = None
+        self._pending_alert_since: float | None = None
+        self._recovery_since: float | None = None
+
+    def _derive_alert_severity(
+        self, smoothed: float | None, level: str, now_s: float
+    ) -> str:
+        """Map smoothed attention risk to an alert severity with hysteresis.
+
+        - LOW_FATIGUE <-> ALERT uses entry/exit hysteresis inside MODERATE.
+        - WARNING (HIGH) requires a short persistence before being emitted.
+        - CRITICAL escalates to DROWSY immediately (genuinely severe evidence).
+        """
+        if level == "SAFE":
+            target = "NORMAL"
+        elif level == "MODERATE":
+            if smoothed is None:
+                target = "LOW_FATIGUE"
+            elif self._alert_severity == "ALERT" and smoothed >= ALERT_EXIT:
+                target = "ALERT"
+            elif smoothed >= ALERT_ENTRY:
+                target = "ALERT"
+            else:
+                target = "LOW_FATIGUE"
+        elif level == "HIGH":
+            target = "WARNING"
+        else:  # CRITICAL
+            target = "DROWSY"
+
+        priority = {"NORMAL": 0, "LOW_FATIGUE": 1, "ALERT": 2, "WARNING": 3, "DROWSY": 4}
+        persistence = {
+            "ALERT": ALERT_PERSISTENCE_S,
+            "WARNING": WARNING_PERSISTENCE_S,
+            "DROWSY": DROWSY_PERSISTENCE_S,
+        }
+        current_priority = priority.get(self._alert_severity, 0)
+        target_priority = priority.get(target, 0)
+        if target_priority > current_priority and target in persistence:
+            if self._pending_alert_target != target or self._pending_alert_since is None:
+                self._pending_alert_target = target
+                self._pending_alert_since = now_s
+                return self._alert_severity
+            if now_s - self._pending_alert_since < persistence[target]:
+                return self._alert_severity
+            self._pending_alert_target = None
+            self._pending_alert_since = None
+        elif target_priority <= current_priority:
+            self._pending_alert_target = None
+            self._pending_alert_since = None
+
+        if target_priority < current_priority:
+            if self._recovery_since is None:
+                self._recovery_since = now_s
+                return self._alert_severity
+            if now_s - self._recovery_since < RECOVERY_PERSISTENCE_S:
+                return self._alert_severity
+            self._recovery_since = None
+        else:
+            self._recovery_since = None
+
+        self._alert_severity = target
+        return target
 
     def _update_smoothed(self, raw: float | None, now_s: float) -> float | None:
         if raw is None:
@@ -264,21 +358,28 @@ class AttentionEngine:
         if distraction is not None and distraction.head is not None:
             head_dir = str(distraction.head.direction or "unknown")
 
-        raw = fuse_raw_risk(f, d)
+        distraction_duration_s = 0.0
+        if distraction is not None:
+            if distraction.primary == "looking_down":
+                distraction_duration_s = distraction.looking_down.duration_s
+            elif distraction.primary == "head_turn_left":
+                distraction_duration_s = distraction.head_turn_left.duration_s
+            elif distraction.primary == "head_turn_right":
+                distraction_duration_s = distraction.head_turn_right.duration_s
+            elif distraction.primary == "passenger_side":
+                distraction_duration_s = distraction.passenger_side.duration_s
+        raw = fuse_raw_risk(f, d, distraction.primary if distraction is not None else None, distraction_duration_s)
         # Honour configured weights if callers customized them.
         if (
             abs(self.weight_fatigue - WEIGHT_FATIGUE) > 1e-9
             or abs(self.weight_distraction - WEIGHT_DISTRACTION) > 1e-9
         ):
+            adjusted_d = d * _distraction_type_factor(distraction.primary if distraction is not None else None, distraction_duration_s)
             raw = min(
                 100.0,
-                max(
-                    self.weight_fatigue * f + self.weight_distraction * d,
-                    f,
-                    d * 0.90,
-                ),
+                self.weight_fatigue * f + self.weight_distraction * adjusted_d,
             )
-            if f >= 40.0 and d >= 40.0:
+            if f >= 40.0 and adjusted_d >= 40.0:
                 raw = min(100.0, raw + 8.0)
 
         # Location / weather amplify the fused driver risk (do not rewrite detectors).
@@ -289,25 +390,38 @@ class AttentionEngine:
         if smoothed is not None:
             smoothed = min(100.0, max(0.0, float(smoothed)))
         level = risk_level_from_score(smoothed)
-        # Within MODERATE, escalate soft→ALERT once risk clears former ALERT entry.
-        if level == "MODERATE" and smoothed is not None and smoothed >= 35.0:
-            alert = "ALERT"
-        else:
-            alert = LEVEL_TO_ALERT.get(level, "NORMAL")
+        alert = self._derive_alert_severity(smoothed, level, now_s)
 
         reason = "Attentive"
         dist_primary = distraction.primary if distraction is not None else "none"
         if smoothed is not None and smoothed > SAFE_MAX:
             if f >= d and f >= loc and f >= wx:
-                reason = "Fatigue risk elevated"
+                if f >= 70.0:
+                    reason = "Prolonged eye closure"
+                elif f >= 45.0:
+                    reason = "Fatigue risk elevated"
+                else:
+                    reason = "Fatigue risk increasing"
             elif d >= loc and d >= wx and dist_primary != "none":
-                reason = f"Distraction: {dist_primary.replace('_', ' ')}"
+                if dist_primary == "looking_down":
+                    reason = "Sustained attention away from the road"
+                elif dist_primary.startswith("head_turn"):
+                    reason = "Head direction away from the road"
+                elif dist_primary == "passenger_side":
+                    reason = "Extended lateral attention"
+                else:
+                    reason = "Distraction risk elevated"
             elif loc >= wx and loc >= 40.0:
-                reason = f"Location context: {zone.replace('_', ' ')}"
+                reason = f"Location risk: {zone.replace('_', ' ')}"
             elif wx >= 40.0:
-                reason = f"Weather context: {wx_cond.replace('_', ' ')}"
+                reason = f"Weather risk: {wx_cond.replace('_', ' ')}"
             else:
-                reason = "Distraction risk elevated"
+                reason = "Attention risk elevated"
+
+        if smoothed is not None:
+            alertness_score = max(0.0, min(100.0, 100.0 - float(smoothed)))
+        else:
+            alertness_score = 100.0
 
         safe_stop = level == "CRITICAL"
         recommendation = (
@@ -328,6 +442,9 @@ class AttentionEngine:
             primary_reason=reason,
             distraction_primary=dist_primary,
             face_ok=True,
+            alertness_score=alertness_score,
+            fatigue_score=f,
+            distraction_score=d,
             location_risk=loc,
             weather_risk=wx,
             location_zone=zone,

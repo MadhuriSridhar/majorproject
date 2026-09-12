@@ -11,6 +11,7 @@ never claimed from cloudy skies alone.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_PATH = PROJECT_ROOT / "config" / "weather_cache.json"
 
 WEATHER_UPDATE_INTERVAL_S = 180.0
+WEATHER_CACHE_MAX_AGE_S = 3 * 60 * 60
 
 OPEN_METEO_URL = (
     "https://api.open-meteo.com/v1/forecast"
@@ -247,13 +249,20 @@ class WeatherContextProvider:
             return
         try:
             data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+            updated_at = data.get("updated_at")
+            cache_fresh = False
+            if updated_at is not None:
+                try:
+                    cache_fresh = max(0.0, time.time() - float(updated_at)) <= WEATHER_CACHE_MAX_AGE_S
+                except (TypeError, ValueError):
+                    cache_fresh = False
             self._last_ctx = EnvironmentalContext(
-                weather_condition=str(data.get("weather_condition", "unknown")),
+                weather_condition=str(data.get("weather_condition", "unknown")) if cache_fresh else "unknown",
                 temperature=data.get("temperature"),
                 visibility=data.get("visibility"),
                 precipitation=data.get("precipitation"),
                 wind=data.get("wind"),
-                weather_risk=float(data.get("weather_risk", 0.0)),
+                weather_risk=float(data.get("weather_risk", 0.0)) if cache_fresh else 0.0,
                 source="cache",
                 available=True,
                 latitude=data.get("latitude"),
@@ -282,6 +291,7 @@ class WeatherContextProvider:
                         "last_update_text": ctx.last_update_text,
                         "rain_expected_soon": ctx.rain_expected_soon,
                         "rain_expected_text": ctx.rain_expected_text,
+                        "updated_at": time.time(),
                     },
                     indent=2,
                 ),

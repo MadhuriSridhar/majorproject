@@ -14,7 +14,7 @@ SETTINGS_FILE = PROJECT_ROOT / "settings.json"
 
 DEFAULT_SETTINGS: dict = {
     "alert_volume": 0.6,
-    "alarm_volume": 0.6,  # mirrored; same Settings volume as alert_volume
+    "alarm_volume": 0.7,  # independent alarm volume (WARNING / DROWSY)
     "voice_enabled": True,
     "visual_alerts_enabled": True,
     "sound_enabled": True,

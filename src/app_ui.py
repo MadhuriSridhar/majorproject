@@ -107,6 +107,9 @@ FONT_BODY = ("Segoe UI", 10)
 FONT_SMALL = ("Segoe UI", 9)
 FONT_BIG = ("Segoe UI", 42, "bold")
 
+SESSION_WARMUP_MIN_S = 1.5
+SESSION_WARMUP_MIN_FRAMES = 5
+
 
 def resolve_driver_state(active: bool, camera_ok: bool, num_faces: int) -> str:
     """
@@ -168,6 +171,15 @@ class CameraWorker(threading.Thread):
         self.camera_error: str | None = None
         self._lock = threading.Lock()
 
+        # Context (location / weather) is fetched in a dedicated background
+        # thread so GPS/HTTP never blocks the real-time camera loop. The camera
+        # loop only reads the latest published snapshot.
+        self._context_lock = threading.Lock()
+        self._location_ctx = None
+        self._weather_ctx = None
+        self._context_stop = threading.Event()
+        self._context_thread: threading.Thread | None = None
+
         # Persistent detection objects.
         self.eye_tracker = EyeClosureTracker()
         self.yawn_tracker = YawnTracker()
@@ -185,7 +197,42 @@ class CameraWorker(threading.Thread):
         self._last_fps_time = 0.0
         self._frame_count = 0
         self._last_timestamp_ms = -1
+        self._valid_evidence_since: float | None = None
+        self._valid_evidence_frames = 0
+        self._last_diagnostic_signature: tuple | None = None
+        self._last_diagnostic_log_s: float | None = None
         self._apply_context_settings()
+
+    def reset_session_state(self) -> None:
+        """Clear all driver evidence before a new session begins."""
+        self.eye_tracker.reset()
+        self.yawn_tracker.reset()
+        self.fatigue_engine.reset(clear_history=True)
+        self.distraction_monitor.reset()
+        self.attention_engine.reset()
+        self.alert_controller.reset()
+        self._valid_evidence_since = None
+        self._valid_evidence_frames = 0
+        self._last_diagnostic_signature = None
+        self._last_diagnostic_log_s = None
+        with self._context_lock:
+            self._location_ctx = None
+            self._weather_ctx = None
+
+    def _evidence_ready(self, now_s: float, face_valid: bool) -> bool:
+        """Require a short contiguous run of valid face evidence at startup."""
+        if not face_valid:
+            self._valid_evidence_since = None
+            self._valid_evidence_frames = 0
+            return False
+        if self._valid_evidence_since is None:
+            self._valid_evidence_since = now_s
+            self._valid_evidence_frames = 0
+        self._valid_evidence_frames += 1
+        return (
+            self._valid_evidence_frames >= SESSION_WARMUP_MIN_FRAMES
+            and now_s - self._valid_evidence_since >= SESSION_WARMUP_MIN_S
+        )
 
     def _apply_context_settings(self) -> None:
         """Refresh location/weather/distraction config from SettingsStore."""
@@ -205,6 +252,85 @@ class CameraWorker(threading.Thread):
             pass
         self.location_provider.configure(mode=mode, demo_zone=demo_zone)
         self.weather_provider.configure(enabled=weather_on)
+
+    def _log_diagnostics(
+        self,
+        now_s: float,
+        eye_state,
+        mouth_state,
+        distraction,
+        decision,
+        attention,
+        alert_result,
+    ) -> dict:
+        """Publish and throttle live pipeline diagnostics for startup triage."""
+        head = distraction.head if distraction is not None else None
+        values = {
+            "ear": getattr(eye_state, "ear", None),
+            "eye_state": getattr(eye_state, "eye", "UNKNOWN"),
+            "eye_closure_s": getattr(eye_state, "current_closure_s", 0.0),
+            "blink_count": getattr(eye_state, "blink_count", 0),
+            "blink_rate": getattr(eye_state, "blink_rate", None),
+            "mar": getattr(mouth_state, "mar", None),
+            "yawn_count": getattr(mouth_state, "yawn_count", 0),
+            "head_yaw": getattr(head, "yaw_deg", None),
+            "head_pitch": getattr(head, "pitch_deg", None),
+            "head_direction": getattr(head, "direction", "unknown"),
+            "head_direction_duration_s": getattr(head, "duration_s", 0.0),
+            "distraction_channels": {
+                name: getattr(getattr(distraction, name, None), "score", 0.0)
+                for name in ("head_turn_left", "head_turn_right", "looking_down", "passenger_side")
+            },
+            "raw_distraction_risk": getattr(distraction, "distraction_risk", 0.0),
+            "fatigue_risk": getattr(decision, "smoothed_risk", None),
+            "raw_fatigue_risk": getattr(decision, "fatigue_score", 0.0),
+            "raw_attention_risk": getattr(attention, "raw_combined", 0.0),
+            "smoothed_attention_risk": getattr(attention, "combined_risk", 0.0),
+            "raw_alertness": max(0.0, 100.0 - float(getattr(attention, "raw_combined", 0.0))),
+            "smoothed_alertness": getattr(attention, "alertness_score", 100.0),
+            "candidate_severity": getattr(attention, "level", "SAFE"),
+            "alertness": getattr(attention, "alertness_score", 100.0),
+            "alert_severity": getattr(alert_result, "active_severity", "NORMAL"),
+            "primary_alert_reason": getattr(attention, "primary_reason", ""),
+            "alert_debug": self.alert_controller.debug_state,
+        }
+        signature = (
+            values["eye_state"], values["head_direction"], values["alert_severity"],
+            round(float(values["smoothed_attention_risk"] or 0.0), 1),
+            values["primary_alert_reason"],
+        )
+        should_log = signature != self._last_diagnostic_signature
+        if self._last_diagnostic_log_s is None or now_s - self._last_diagnostic_log_s >= 2.0:
+            should_log = True
+        if should_log:
+            print(f"DIAGNOSTICS: {values}")
+            self._last_diagnostic_signature = signature
+            self._last_diagnostic_log_s = now_s
+        return values
+
+    def _context_worker(self) -> None:
+        """Background loop: fetch location + weather off the camera thread.
+
+        The providers throttle their own network work; this loop only drives
+        them on a slow cadence and publishes the latest result so the camera
+        loop can keep using the last-known context without ever waiting on HTTP.
+        """
+        while not self._context_stop.is_set():
+            try:
+                self._apply_context_settings()
+                now = time.monotonic()
+                location_ctx = self.location_provider.update(now)
+                if location_ctx.available:
+                    self.weather_provider.set_coordinates(
+                        location_ctx.latitude, location_ctx.longitude
+                    )
+                weather_ctx = self.weather_provider.update(now)
+                with self._context_lock:
+                    self._location_ctx = location_ctx
+                    self._weather_ctx = weather_ctx
+            except Exception as exc:
+                print(f"Context worker error: {exc}")
+            self._context_stop.wait(1.0)
 
     def start_camera(self) -> None:
         self.stop_event.clear()
@@ -230,6 +356,14 @@ class CameraWorker(threading.Thread):
         # Only start the loop thread once.
         if not self.is_alive():
             self.start()
+        # Start (or restart) the context worker so GPS/weather never blocks the
+        # camera loop.
+        if self._context_thread is None or not self._context_thread.is_alive():
+            self._context_stop.clear()
+            self._context_thread = threading.Thread(
+                target=self._context_worker, name="context-worker", daemon=True
+            )
+            self._context_thread.start()
 
     def run(self) -> None:
         """Run the capture/detect loop until stopped, then finalize resources.
@@ -289,6 +423,10 @@ class CameraWorker(threading.Thread):
                     self.session_manager.active, self.camera_ok, num_faces
                 )
 
+                session_active = self.session_manager.active
+                valid_face = should_run_analysis(session_active, self.camera_ok, num_faces)
+                warmup_ready = self._evidence_ready(now, valid_face)
+
                 # Facial feature extraction (only with exactly one face).
                 eye_state = None
                 mouth_state = None
@@ -299,27 +437,40 @@ class CameraWorker(threading.Thread):
                     mouth = analyze_mouth(face, w, h)
                     draw_ear_eye_landmarks(annotated, face)
                     draw_mar_mouth_landmarks(annotated, face)
-                    eye_state = self.eye_tracker.update(eyes.average_ear, now)
-                    mouth_state = self.yawn_tracker.update(mouth.mar, now)
-                    if self.distraction_enabled:
-                        distraction_obs = self.distraction_monitor.update(face, w, h, now)
+                    if session_active:
+                        eye_state = self.eye_tracker.update(eyes.average_ear, now)
+                        mouth_state = self.yawn_tracker.update(mouth.mar, now)
+                        if valid_face and not warmup_ready and eye_state.eye == "OPEN":
+                            self.distraction_monitor.head_tracker.calibrate(face, w, h)
+                        if warmup_ready:
+                            self.distraction_monitor.head_tracker.finish_calibration()
+                        if self.distraction_enabled:
+                            distraction_obs = self.distraction_monitor.update(face, w, h, now)
+                        else:
+                            self.distraction_monitor.reset()
                     else:
-                        self.distraction_monitor.reset()
+                        # Preview metrics are frame-local. Do not accumulate
+                        # fatigue or distraction evidence before START.
+                        eye_state = eyes
+                        mouth_state = mouth
                 else:
-                    eye_state = self.eye_tracker.update(None, now)
-                    mouth_state = self.yawn_tracker.update(None, now)
-                    self.distraction_monitor.reset()
+                    if session_active:
+                        eye_state = self.eye_tracker.update(None, now)
+                        mouth_state = self.yawn_tracker.update(None, now)
+                        self.distraction_monitor.reset()
 
                 time_ctx = get_time_context()
 
-                # Location / weather: throttled inside providers (not every frame).
-                self._apply_context_settings()
-                location_ctx = self.location_provider.update(now)
-                if location_ctx.available:
-                    self.weather_provider.set_coordinates(
-                        location_ctx.latitude, location_ctx.longitude
-                    )
-                weather_ctx = self.weather_provider.update(now)
+                # Location / weather: published by the background context worker.
+                # The camera loop never performs network I/O here, so GPS/HTTP
+                # failures or delays can never stall the real-time pipeline.
+                with self._context_lock:
+                    location_ctx = self._location_ctx
+                    weather_ctx = self._weather_ctx
+                if location_ctx is None:
+                    location_ctx = self.location_provider._unavailable("Unavailable")
+                if weather_ctx is None:
+                    weather_ctx = self.weather_provider._unavailable("Unavailable")
 
                 loc_risk = (
                     float(location_ctx.risk_level or 0.0)
@@ -336,7 +487,7 @@ class CameraWorker(threading.Thread):
                 decision = None
                 attention = None
                 alert_result = None
-                if should_run_analysis(self.session_manager.active, self.camera_ok, num_faces):
+                if valid_face and warmup_ready:
                     evidence = build_fatigue_evidence(
                         eye=eye_state,
                         mouth=mouth_state,
@@ -360,14 +511,46 @@ class CameraWorker(threading.Thread):
                         location_zone=str(location_ctx.zone_type or "none"),
                         weather_condition=str(weather_ctx.weather_condition or "unknown"),
                     )
-                    # Alerts follow combined attention severity (maps to existing
-                    # audio path). Fatigue severity remains available on decision.
+                    # Alerts follow combined attention severity, but the live
+                    # reason and score remain available to the single escalation
+                    # controller so the UI and audio speak the true cause.
                     alert_result = self.alert_controller.update(
-                        attention.alert_severity, now
+                        attention.alert_severity,
+                        now,
+                        reason=attention.primary_reason,
+                        contributing_factors=(
+                            attention.distraction_primary,
+                            "fatigue" if attention.fatigue_score >= 50.0 else "stable",
+                        ),
+                        alertness_score=attention.alertness_score,
+                        fatigue_score=attention.fatigue_score,
+                        distraction_score=attention.distraction_score,
                     )
                     if alert_result.should_play_audio:
-                        self.audio_engine.play_alert(alert_result.audio_severity)
-                    self.session_manager.update(decision, now)
+                        self.audio_engine.play_alert(
+                            alert_result.audio_severity,
+                            reason=alert_result.reason,
+                            contributing_factors=alert_result.contributing_factors,
+                        )
+                    self.session_manager.update(
+                        decision,
+                        now,
+                        attention=attention,
+                        alert_result=alert_result,
+                    )
+                elif valid_face:
+                    # Warm-up evidence is allowed to build temporal trackers,
+                    # but cannot become UI/alert output yet.
+                    evidence = build_fatigue_evidence(
+                        eye=eye_state,
+                        mouth=mouth_state,
+                        time_ctx=time_ctx,
+                        driving=self.session_manager.driving_result(now),
+                        face_detected=True,
+                    )
+                    self.fatigue_engine.update(evidence, now)
+                    self.attention_engine.reset()
+                    alert_result = self.alert_controller.update("NORMAL", now)
                 else:
                     # No valid fatigue assessment - reset engine state safely.
                     self.fatigue_engine.reset()
@@ -378,6 +561,16 @@ class CameraWorker(threading.Thread):
                     # resetting or fabricating events.
                     if self.session_manager.active:
                         self.session_manager.record_no_face(now)
+
+                diagnostics = self._log_diagnostics(
+                    now,
+                    eye_state,
+                    mouth_state,
+                    distraction_obs,
+                    decision,
+                    attention,
+                    alert_result,
+                )
 
                 # Push frame + state to UI.
                 try:
@@ -398,6 +591,7 @@ class CameraWorker(threading.Thread):
                             "location": location_ctx,
                             "weather": weather_ctx,
                             "alert_result": alert_result,
+                            "diagnostics": diagnostics,
                             "time_ctx": time_ctx,
                             "fps": self._fps,
                             "camera_ok": self.camera_ok,
@@ -445,6 +639,7 @@ class CameraWorker(threading.Thread):
         the resources itself.
         """
         self.stop_event.set()
+        self._context_stop.set()
         self.camera_ok = False
         self.camera_state = "DISCONNECTED"
         self.camera_error = "Camera stopped."
@@ -564,13 +759,13 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(self, text="SETTINGS", font=FONT_SUBTITLE, bg=BG, fg=FG_BRIGHT).pack(pady=(12, 4))
         tk.Label(self, text="ALERT SETTINGS", font=FONT_SMALL, bg=BG, fg=ACCENT).pack(pady=(8, 2))
 
-        # Volume sliders (mirrored): either control all voice/alarm playback.
-        self._syncing_volume = False
-        unified = float(self.store.get("alert_volume", 0.6))
+        # Independent volume sliders: Alert volume and Alarm volume are separate.
+        alert_vol = float(self.store.get("alert_volume", 0.6))
+        alarm_vol = float(self.store.get("alarm_volume", 0.7))
         row1 = tk.Frame(self, bg=BG)
         row1.pack(fill="x", padx=20, pady=4)
         tk.Label(row1, text="Alert volume", font=FONT_BODY, bg=BG, fg=FG).pack(side="left")
-        self.alert_var = tk.DoubleVar(value=unified)
+        self.alert_var = tk.DoubleVar(value=alert_vol)
         ttk.Scale(
             row1, from_=0.0, to=1.0, variable=self.alert_var, command=self._on_alert_volume
         ).pack(side="right", fill="x", expand=True, padx=10)
@@ -578,7 +773,7 @@ class SettingsDialog(tk.Toplevel):
         row2 = tk.Frame(self, bg=BG)
         row2.pack(fill="x", padx=20, pady=4)
         tk.Label(row2, text="Alarm volume", font=FONT_BODY, bg=BG, fg=FG).pack(side="left")
-        self.alarm_var = tk.DoubleVar(value=unified)
+        self.alarm_var = tk.DoubleVar(value=alarm_vol)
         ttk.Scale(
             row2, from_=0.0, to=1.0, variable=self.alarm_var, command=self._on_alarm_volume
         ).pack(side="right", fill="x", expand=True, padx=10)
@@ -772,29 +967,13 @@ class SettingsDialog(tk.Toplevel):
             lambda e, k=key, v=var: (self.store.set(k, v.get()), self._apply_audio()),
         )
 
-    def _set_unified_volume(self, volume: float) -> None:
-        """Persist one Settings volume and mirror both sliders / engine keys."""
-        volume = max(0.0, min(1.0, float(volume)))
-        self.store.set("alert_volume", volume)
-        self.store.set("alarm_volume", volume)
-        if not self._syncing_volume:
-            self._syncing_volume = True
-            try:
-                self.alert_var.set(volume)
-                self.alarm_var.set(volume)
-            finally:
-                self._syncing_volume = False
+    def _on_alert_volume(self, _val) -> None:
+        self.store.set("alert_volume", max(0.0, min(1.0, float(self.alert_var.get()))))
         self._apply_audio()
 
-    def _on_alert_volume(self, _val) -> None:
-        if self._syncing_volume:
-            return
-        self._set_unified_volume(float(self.alert_var.get()))
-
     def _on_alarm_volume(self, _val) -> None:
-        if self._syncing_volume:
-            return
-        self._set_unified_volume(float(self.alarm_var.get()))
+        self.store.set("alarm_volume", max(0.0, min(1.0, float(self.alarm_var.get()))))
+        self._apply_audio()
 
     def _on_voice(self) -> None:
         self.store.set("voice_enabled", self.voice_var.get())
@@ -831,10 +1010,9 @@ class SettingsDialog(tk.Toplevel):
         self.store.set("location_risk_enabled", bool(self.location_risk_var.get()))
 
     def _apply_audio(self) -> None:
-        volume = float(self.store.get("alert_volume", 0.6))
         self.audio_engine.settings = AudioSettings(
-            alert_volume=volume,
-            alarm_volume=volume,
+            alert_volume=float(self.store.get("alert_volume", 0.6)),
+            alarm_volume=float(self.store.get("alarm_volume", 0.7)),
             voice_enabled=bool(self.store.get("voice_enabled", True)),
             sound_enabled=bool(self.store.get("sound_enabled", True)),
             alert_sound=str(self.store.get("alert_sound", "soft_beep_2")),
@@ -848,7 +1026,7 @@ class DrowsinessApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("Driver Drowsiness Monitor")
+        self.title("Neuro-Symbolic Driver Attention Monitoring")
         self.configure(bg=BG)
         self.geometry("1280x800")
         self.minsize(1024, 700)
@@ -858,10 +1036,9 @@ class DrowsinessApp(tk.Tk):
         self.prefs = DashboardPreferences()
         self.session_manager = SessionManager(use_demo_duration=USE_DEMO_DRIVING_DURATION)
         self.alert_controller = AlertEscalationController()
-        _vol = float(self.settings_store.get("alert_volume", 0.6))
         self.audio_engine = AudioEngine(AudioSettings(
-            alert_volume=_vol,
-            alarm_volume=_vol,
+            alert_volume=float(self.settings_store.get("alert_volume", 0.6)),
+            alarm_volume=float(self.settings_store.get("alarm_volume", 0.7)),
             voice_enabled=bool(self.settings_store.get("voice_enabled", True)),
             sound_enabled=bool(self.settings_store.get("sound_enabled", True)),
             alert_sound=str(self.settings_store.get("alert_sound", "soft_beep_2")),
@@ -942,7 +1119,7 @@ class DrowsinessApp(tk.Tk):
         self.preview_label = tk.Label(preview, bg=BG_PANEL, text="Camera starting...", fg=FG_MUTED)
         self.preview_label.pack(fill="both", expand=True)
 
-        tk.Label(frame, text="DRIVER DROWSINESS MONITOR", font=FONT_TITLE, bg=BG, fg=FG_BRIGHT).pack(pady=(10, 4))
+        tk.Label(frame, text="DRIVER ATTENTION MONITOR", font=FONT_TITLE, bg=BG, fg=FG_BRIGHT).pack(pady=(10, 4))
         self.camera_status_label = tk.Label(
             frame, text="CAMERA: STARTING", font=FONT_SUBTITLE, bg=BG, fg=FG_MUTED
         )
@@ -985,7 +1162,7 @@ class DrowsinessApp(tk.Tk):
         bar.pack_propagate(False)
         self.top_bar = bar
 
-        tk.Label(bar, text="DRIVER DROWSINESS MONITOR", font=("Segoe UI", 12, "bold"), bg=BG_PANEL, fg=FG_BRIGHT).pack(side="left", padx=20)
+        tk.Label(bar, text="NEURO-SYMBOLIC DRIVER ATTENTION MONITORING", font=("Segoe UI", 12, "bold"), bg=BG_PANEL, fg=FG_BRIGHT).pack(side="left", padx=20)
 
         self.tb_time = tk.Label(bar, text="TIME: --:--:--", font=FONT_SMALL, bg=BG_PANEL, fg=FG)
         self.tb_time.pack(side="right", padx=10)
@@ -1018,7 +1195,7 @@ class DrowsinessApp(tk.Tk):
         # Camera panel.
         self.cam_label = self.cam_overlay = None
         if self.prefs.is_enabled("eye_monitoring"):
-            cam_panel = tk.Frame(top, bg=BG_PANEL, bd=0, width=760, height=420)
+            cam_panel = tk.Frame(top, bg=BG_PANEL, bd=0, width=760, height=320)
             cam_panel.pack(side="left", fill="y", padx=(0, 6))
             cam_panel.pack_propagate(False)
             tk.Label(cam_panel, text="LIVE CAMERA", font=FONT_SMALL, bg=BG_PANEL, fg=FG_MUTED).pack(anchor="w", padx=10, pady=(6, 0))
@@ -1037,7 +1214,7 @@ class DrowsinessApp(tk.Tk):
         if self.prefs.is_enabled("fatigue_risk"):
             risk_panel = tk.Frame(right, bg=BG_CARD, bd=1, highlightthickness=1, highlightbackground="#2a3040")
             risk_panel.pack(fill="x", pady=(0, 8))
-            tk.Label(risk_panel, text="OVERALL RISK", font=FONT_SMALL, bg=BG_CARD, fg=FG_MUTED).pack(pady=(8, 0))
+            tk.Label(risk_panel, text="ALERTNESS SCORE", font=FONT_SMALL, bg=BG_CARD, fg=FG_MUTED).pack(pady=(8, 0))
             self.risk_value = tk.Label(risk_panel, text="--", font=FONT_BIG, bg=BG_CARD, fg=FG_BRIGHT)
             self.risk_value.pack()
             self.risk_status = tk.Label(risk_panel, text="SESSION INACTIVE", font=("Segoe UI", 12, "bold"), bg=BG_CARD, fg=GRAY)
@@ -1070,8 +1247,8 @@ class DrowsinessApp(tk.Tk):
             ("distract", "fatigue_risk", "DISTRACTION"),
             ("gaze", "fatigue_risk", "HEAD / GAZE"),
             ("driving_time", "driving_duration", "DRIVING TIME"),
-            ("risk", "fatigue_risk", "OVERALL"),
-            ("status", "fatigue_risk", "LEVEL"),
+            ("risk", "fatigue_risk", "ALERTNESS"),
+            ("status", "fatigue_risk", "CURRENT STATE"),
         ]
         visible_metrics = [item for item in metrics if self.prefs.is_enabled(item[1])]
         if visible_metrics:
@@ -1099,7 +1276,7 @@ class DrowsinessApp(tk.Tk):
         lower.pack(fill="x", padx=12, pady=8)
 
         # Risk breakdown panel.
-        rb_panel = tk.Frame(lower, bg=BG_CARD, bd=1, highlightthickness=1, highlightbackground="#2a3040", height=220)
+        rb_panel = tk.Frame(lower, bg=BG_CARD, bd=1, highlightthickness=1, highlightbackground="#2a3040", height=185)
         rb_panel.pack(side="left", fill="both", expand=True, padx=(0, 6))
         rb_panel.pack_propagate(False)
         rb_header = tk.Frame(rb_panel, bg=BG_CARD)
@@ -1273,6 +1450,7 @@ class DrowsinessApp(tk.Tk):
         self._clear_alert_overlay()
         self.audio_engine.interrupt_all()
         session_id = self.session_manager.start()
+        self.camera_worker.reset_session_state()
         self._running = True
         # Drop any frames pushed by the worker while the session was inactive
         # (preview phase) so the fresh dashboard starts from clean data.
@@ -1533,6 +1711,7 @@ class DrowsinessApp(tk.Tk):
         attention = data.get("attention")
         if attention is not None and attention.face_ok:
             risk = int(round(min(100.0, max(0.0, attention.combined_risk))))
+            alertness = int(round(min(100.0, max(0.0, attention.alertness_score))))
             level = attention.level
             color = {
                 "SAFE": GREEN,
@@ -1541,7 +1720,7 @@ class DrowsinessApp(tk.Tk):
                 "CRITICAL": RED,
             }.get(level, SEVERITY_COLORS.get(attention.alert_severity, GRAY))
             if self.risk_value is not None:
-                self.risk_value.configure(text=str(risk), fg=color)
+                self.risk_value.configure(text=str(alertness), fg=color)
             if self.risk_status is not None:
                 self.risk_status.configure(text=level, fg=color)
             if self.risk_reason is not None:
@@ -1551,7 +1730,7 @@ class DrowsinessApp(tk.Tk):
                 elif attention.recommendation:
                     reason_txt = f"{reason_txt} — {attention.recommendation}"
                 self.risk_reason.configure(text=reason_txt)
-            self._draw_risk_bar(risk, color)
+            self._draw_risk_bar(alertness, color)
         elif decision is not None and decision.smoothed_risk is not None:
             risk = int(round(decision.smoothed_risk))
             severity = decision.severity
@@ -1632,7 +1811,7 @@ class DrowsinessApp(tk.Tk):
                     )
                 overall = int(round(min(100.0, max(0.0, attention.combined_risk))))
                 if "risk" in self._driver_metrics:
-                    self._driver_metrics["risk"].configure(text=f"{overall}/100")
+                    self._driver_metrics["risk"].configure(text=f"{int(round(attention.alertness_score))}/100")
                 if "status" in self._driver_metrics:
                     self._driver_metrics["status"].configure(text=attention.level, fg=color)
             else:
@@ -1675,8 +1854,8 @@ class DrowsinessApp(tk.Tk):
             else:
                 self.ctx_weather.configure(text="WEATHER:\nUnavailable")
 
-        # Risk breakdown (trend / table).
-        self._update_risk_breakdown(decision)
+        # Alertness trend / event table are driven by the recorded session model.
+        self._update_alertness_history_view()
 
         # Alert overlay (uses combined attention risk when available).
         self._update_alert_overlay(alert_result, decision, attention)
@@ -1905,6 +2084,105 @@ class DrowsinessApp(tk.Tk):
                 self.trend_canvas.create_rectangle(lx, legend_y, lx + 8, legend_y + 8, fill=lcolor, outline="")
                 self.trend_canvas.create_text(lx + 12, legend_y + 4, anchor="w", text=label, fill=FG_MUTED, font=("Segoe UI", 7))
                 lx += 12 + len(label) * 5 + 8
+
+    def _update_alertness_history_view(self) -> None:
+        """Render real sampled alertness data and one row per alert episode."""
+        if self.trend_canvas is None or self.rb_table is None:
+            return
+        history = self.session_manager.stats.alertness_history
+        self.trend_canvas.delete("all")
+        for child in self.rb_table.winfo_children():
+            child.destroy()
+
+        if self._trend_mode == "TABLE":
+            self.trend_canvas.pack_forget()
+            self.rb_table.pack(fill="both", expand=True)
+            headers = ("TIME", "EVENT", "SEVERITY", "PRIMARY REASON", "ALERTNESS", "ACTION")
+            for col, header in enumerate(headers):
+                tk.Label(self.rb_table, text=header, font=FONT_SMALL, bg=BG_CARD, fg=ACCENT, anchor="w").grid(
+                    row=0, column=col, sticky="ew", padx=3, pady=2
+                )
+            events = self.session_manager.stats.alert_events[-8:]
+            for row, event in enumerate(events, start=1):
+                event_elapsed = max(0.0, event.start_time_s - self.session_manager.start_mono_s)
+                event_clock = (
+                    self.session_manager.stats.start_time.timestamp() + event_elapsed
+                    if self.session_manager.stats.start_time is not None
+                    else time.time()
+                )
+                stamp = time.strftime("%H:%M:%S", time.localtime(event_clock))
+                values = (
+                    stamp,
+                    "Attention Alert",
+                    event.severity,
+                    event.primary_reason or "Attention risk elevated",
+                    f"{event.minimum_alertness:.0f}",
+                    event.action or "Stay focused",
+                )
+                for col, value in enumerate(values):
+                    tk.Label(
+                        self.rb_table,
+                        text=value,
+                        font=FONT_SMALL,
+                        bg=BG_CARD,
+                        fg=FG,
+                        anchor="w",
+                        justify="left",
+                        wraplength=130 if col in (3, 5) else 80,
+                    ).grid(row=row, column=col, sticky="ew", padx=3, pady=2)
+            if not events:
+                tk.Label(self.rb_table, text="No alert episodes recorded.", font=FONT_BODY, bg=BG_CARD, fg=FG_MUTED).grid(
+                    row=1, column=0, columnspan=len(headers), sticky="w", padx=3, pady=8
+                )
+            for col in range(len(headers)):
+                self.rb_table.columnconfigure(col, weight=1 if col in (3, 5) else 0)
+            return
+
+        self.rb_table.pack_forget()
+        self.trend_canvas.pack(fill="both", expand=True)
+        self.trend_canvas.create_text(10, 8, anchor="nw", text="ALERTNESS TREND", fill=FG_MUTED, font=FONT_SMALL)
+        if len(history) < 2:
+            self.trend_canvas.create_text(10, 34, anchor="nw", text="CALIBRATING / COLLECTING DATA...", fill=FG_MUTED, font=FONT_BODY)
+            return
+
+        left = 10
+        top = 28
+        width = max(180, self.trend_canvas.winfo_width() - 20)
+        height = max(45, int(self.trend_canvas.cget("height")) - 50)
+        start = history[0].timestamp_s
+        span = max(1.0, history[-1].timestamp_s - start)
+        self.trend_canvas.create_line(left, top, left, top + height, fill="#3a4254")
+        self.trend_canvas.create_line(left, top + height, left + width, top + height, fill="#3a4254")
+        points: list[tuple[float, float]] = []
+        for sample in history:
+            if sample.alertness is None:
+                points = []
+                continue
+            x = left + ((sample.timestamp_s - start) / span) * width
+            y = top + (1.0 - sample.alertness / 100.0) * height
+            if points:
+                self.trend_canvas.create_line(points[-1][0], points[-1][1], x, y, fill=GREEN, width=3)
+            points.append((x, y))
+        if points:
+            x, y = points[-1]
+            self.trend_canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=GREEN, outline="")
+        for value in (100, 50, 0):
+            y = top + (1.0 - value / 100.0) * height
+            self.trend_canvas.create_text(left + 2, y, anchor="sw" if value else "nw", text=str(value), fill=FG_MUTED, font=("Segoe UI", 7))
+        stats = self.session_manager.stats
+        self.trend_canvas.create_text(
+            left + 55,
+            top + height + 10,
+            anchor="nw",
+            text=(
+                f"Avg {stats.average_alertness:.0f}   Min {stats.minimum_alertness:.0f}   "
+                f"Max {stats.maximum_alertness:.0f}   Safe {stats.time_safe_s:.0f}s   "
+                f"Moderate {stats.time_moderate_s:.0f}s   High {stats.time_high_s:.0f}s   "
+                f"Critical {stats.time_critical_s:.0f}s"
+            ),
+            fill=FG_MUTED,
+            font=("Segoe UI", 8),
+        )
 
     def _severity_glow_color(self, severity: str) -> str:
         """Glow/accent color for the alert popup by severity."""

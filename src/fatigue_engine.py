@@ -46,6 +46,9 @@ WARNING_ENTRY = 50
 WARNING_RECOVERY = 35
 DROWSY_ENTRY = 70
 DROWSY_RECOVERY = 50
+# NOTE: WARNING persistence for *alerts* is enforced in attention_engine.py
+# (WARNING_PERSISTENCE_S). The rule-based status here intentionally responds to
+# score quickly; severity escalation keeps its own temporal gating.
 WARNING_PERSISTENCE_SECONDS = 0.0
 DROWSY_PERSISTENCE_SECONDS = 0.0
 WARNING_RECOVERY_SECONDS = 0.8
@@ -206,7 +209,8 @@ class FatigueEngine:
         self._last_blink_sample_s: float | None = None
         self._last_update_s: float | None = None
 
-    def reset(self) -> None:
+    def reset(self, clear_history: bool = False) -> None:
+        """Reset live state; optionally discard evidence from an old session."""
         self._severity = "NORMAL"
         self._pending_severity = None
         self._pending_since = None
@@ -218,8 +222,12 @@ class FatigueEngine:
         self._status = "SAFE"
         self._status_pending = None
         self._status_since = None
-        # NOTE: recent-evidence history is intentionally preserved across
-        # reset() so temporary face loss does not erase session history.
+        if clear_history:
+            self._recent_yawn_evidence = 0.0
+            self._recent_blink_evidence = 0.0
+            self._last_yawn_count = None
+            self._last_blink_sample_s = None
+            self._last_update_s = None
 
     def _current_blink_anomaly_magnitude(self, evidence: FatigueEvidence) -> float:
         """Magnitude of the current abnormal-blink signal (0 when normal)."""
@@ -405,11 +413,9 @@ class FatigueEngine:
         blink_risk = max(blink_risk, self._recent_blink_evidence)
         blink_risk = min(BLINK_ANOMALY_MAX, max(0.0, blink_risk))
 
-        # Yawn contribution is bounded by its configured weight (default 15).
-        # One genuine yawn: small temporary increase. Repeated yawns: larger
-        # increase, but never exceeding the intended weight. The frequency term
-        # scales within [0, weight_yawn] so repeated yawns grow the risk without
-        # overwhelming eye behaviour.
+        # One genuine yawn contributes the configured weight (default 15).
+        # Repeated yawns accumulate as decaying recent evidence and may grow the
+        # contribution up to RECENT_YAWN_MAX, but never beyond it.
         yawn_risk = 0.0
         if evidence.yawn_detected:
             yawn_risk = float(self.weight_yawn)
@@ -418,8 +424,10 @@ class FatigueEngine:
             yawn_risk = max(yawn_risk, freq_risk)
         # Decaying recent-yawn evidence (repeated yawns strengthen support).
         yawn_risk = max(yawn_risk, self._recent_yawn_evidence)
-        # Final yawn contribution never exceeds the configured weight (default 15).
-        yawn_risk = min(float(self.weight_yawn), max(0.0, yawn_risk))
+        # A single yawn contributes weight_yawn; repeated yawns may strengthen
+        # the contribution up to RECENT_YAWN_MAX, but never beyond it (and never
+        # below the configured single-yawn weight).
+        yawn_risk = min(max(self.weight_yawn, RECENT_YAWN_MAX), max(0.0, yawn_risk))
 
         night_risk = float(self.weight_night) if evidence.night_context else 0.0
         duration_risk = 0.0

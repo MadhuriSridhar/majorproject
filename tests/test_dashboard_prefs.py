@@ -76,6 +76,17 @@ class SettingsStoreTests(unittest.TestCase):
         store = SettingsStore(path=self.path)
         self.assertEqual(store.get("voice_enabled"), True)
 
+    def test_alert_and_alarm_volume_independent(self) -> None:
+        store = SettingsStore(path=self.path)
+        store.set("alert_volume", 0.3)
+        store.set("alarm_volume", 0.9)
+        reloaded = SettingsStore(path=self.path)
+        self.assertAlmostEqual(reloaded.get("alert_volume"), 0.3)
+        self.assertAlmostEqual(reloaded.get("alarm_volume"), 0.9)
+        # Changing one must not change the other.
+        reloaded.set("alert_volume", 0.5)
+        self.assertAlmostEqual(reloaded.get("alarm_volume"), 0.9)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -45,6 +46,7 @@ DEMO_LAT = 12.9716
 DEMO_LON = 77.5946
 
 LOCATION_UPDATE_INTERVAL_S = 30.0
+LOCATION_CACHE_MAX_AGE_S = 30 * 60
 
 IP_GEO_URLS = (
     "http://ip-api.com/json/?fields=status,message,lat,lon,city,regionName,country,query",
@@ -65,6 +67,23 @@ class LocationContext:
     mode: str = "gps"  # gps | demo | disabled
 
 
+@dataclass(frozen=True)
+class GeofenceZone:
+    """A configurable real-world geofence record (lat/lon + radius)."""
+
+    name: str
+    zone_type: str  # school | highway | construction | sharp_turn | other
+    latitude: float
+    longitude: float
+    radius_m: float
+    risk_level: float  # 0..100
+
+
+# Optional real-world geofence dataset (user-configurable, kept empty by
+# default so the app never pretends arbitrary coordinates are real zones).
+GEOFENCES_FILE = PROJECT_ROOT / "config" / "geofences.json"
+
+
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371000.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -72,6 +91,48 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlmb = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
     return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+def load_geofences(path: Path | None = None) -> list[GeofenceZone]:
+    """Load the configurable geofence dataset (empty on any failure)."""
+    target = Path(path) if path else GEOFENCES_FILE
+    if not target.is_file():
+        return []
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    zones: list[GeofenceZone] = []
+    for raw in data.get("zones", []) if isinstance(data, dict) else []:
+        try:
+            zones.append(
+                GeofenceZone(
+                    name=str(raw.get("name", "Zone")),
+                    zone_type=str(raw.get("zone_type", "other")),
+                    latitude=float(raw["latitude"]),
+                    longitude=float(raw["longitude"]),
+                    radius_m=float(raw.get("radius_m", 500.0)),
+                    risk_level=float(raw.get("risk_level", 50.0)),
+                )
+            )
+        except (TypeError, ValueError, KeyError):
+            continue
+    return zones
+
+
+def classify_geofence(
+    lat: float, lon: float, zones: list[GeofenceZone] | None = None
+) -> tuple[str, str, float] | None:
+    """Return (zone_type, zone_name, risk_level) for the first matching zone."""
+    if lat is None or lon is None:
+        return None
+    for zone in zones or []:
+        try:
+            if haversine_m(float(lat), float(lon), zone.latitude, zone.longitude) <= zone.radius_m:
+                return (zone.zone_type, zone.name, zone.risk_level)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _http_json(url: str, timeout_s: float = 4.0) -> dict | None:
@@ -120,7 +181,33 @@ class LocationRiskProvider:
         self.timeout_s = float(timeout_s)
         self._last_update = 0.0
         self._last_ctx = self._unavailable("Unavailable")
+        self._geofences = load_geofences()
         self._load_cache()
+
+    def reload_geofences(self) -> None:
+        """Re-read the configurable geofence dataset at runtime."""
+        self._geofences = load_geofences()
+
+    def _context_for_coordinates(
+        self, lat: float, lon: float, source: str, place_name: str = ""
+    ) -> LocationContext:
+        """Build a GPS/IP context, applying any matching configured geofence."""
+        hit = classify_geofence(lat, lon, self._geofences)
+        if hit:
+            zone_type, zone_name, risk = hit
+        else:
+            zone_type, zone_name, risk = "none", "Normal Road", 5.0
+        return LocationContext(
+            latitude=float(lat),
+            longitude=float(lon),
+            zone_type=zone_type,
+            zone_name=zone_name,
+            risk_level=float(risk),
+            source=source,
+            place_name=place_name,
+            available=True,
+            mode="gps",
+        )
 
     def configure(self, mode: str | None = None, demo_zone: str | None = None) -> None:
         if mode is not None:
@@ -153,12 +240,19 @@ class LocationRiskProvider:
             data = json.loads(LOCATION_CACHE_PATH.read_text(encoding="utf-8"))
             lat = float(data["latitude"])
             lon = float(data["longitude"])
+            updated_at = data.get("updated_at")
+            cache_fresh = False
+            if updated_at is not None:
+                try:
+                    cache_fresh = max(0.0, time.time() - float(updated_at)) <= LOCATION_CACHE_MAX_AGE_S
+                except (TypeError, ValueError):
+                    cache_fresh = False
             self._last_ctx = LocationContext(
                 latitude=lat,
                 longitude=lon,
-                zone_type=str(data.get("zone_type", "none")),
-                zone_name=str(data.get("zone_name", "Normal Road")),
-                risk_level=float(data.get("risk_level", 0.0)),
+                zone_type=str(data.get("zone_type", "none")) if cache_fresh else "none",
+                zone_name=str(data.get("zone_name", "Normal Road")) if cache_fresh else "Normal Road",
+                risk_level=float(data.get("risk_level", 0.0)) if cache_fresh else 0.0,
                 source="cache",
                 place_name=str(data.get("place_name", "")),
                 available=True,
@@ -182,6 +276,7 @@ class LocationRiskProvider:
                         "zone_name": ctx.zone_name,
                         "risk_level": ctx.risk_level,
                         "source": ctx.source,
+                        "updated_at": time.time(),
                     },
                     indent=2,
                 ),
@@ -287,17 +382,7 @@ class LocationRiskProvider:
         win = self._try_windows_geolocation()
         if win is not None:
             lat, lon, _acc = win
-            ctx = LocationContext(
-                latitude=lat,
-                longitude=lon,
-                zone_type="none",
-                zone_name="Normal Road",
-                risk_level=5.0,
-                source="gps",
-                place_name="GPS fix",
-                available=True,
-                mode="gps",
-            )
+            ctx = self._context_for_coordinates(lat, lon, "gps", "GPS fix")
             self._save_cache(ctx)
             self._last_ctx = ctx
             return ctx
@@ -305,17 +390,7 @@ class LocationRiskProvider:
         ip = self._try_ip_geolocation()
         if ip is not None:
             lat, lon, place = ip
-            ctx = LocationContext(
-                latitude=lat,
-                longitude=lon,
-                zone_type="none",
-                zone_name="Normal Road",
-                risk_level=5.0,
-                source="ip",
-                place_name=place or "Network location",
-                available=True,
-                mode="gps",
-            )
+            ctx = self._context_for_coordinates(lat, lon, "ip", place or "Network location")
             self._save_cache(ctx)
             self._last_ctx = ctx
             return ctx

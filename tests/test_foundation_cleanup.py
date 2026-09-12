@@ -17,7 +17,11 @@ sys.path.insert(0, str(ROOT / "src"))
 from alert_escalation import AlertEscalationController  # noqa: E402
 from app_ui import resolve_driver_state, should_run_analysis  # noqa: E402
 from audio_engine import AudioBackend, AudioSettings  # noqa: E402
-from fatigue_engine import FatigueEngine, FatigueEvidence  # noqa: E402
+from fatigue_engine import (  # noqa: E402
+    RECENT_YAWN_MAX,
+    FatigueEngine,
+    FatigueEvidence,
+)
 from predefined_sounds import (  # noqa: E402
     ALERT_ALARM_DURATION_SECONDS,
     DROWSY_ALARM_DURATION_SECONDS,
@@ -52,8 +56,9 @@ class YawnContributionCapTests(unittest.TestCase):
         engine = FatigueEngine()
         one = engine.decide(E(yawn_detected=True, yawn_count=1, recent_yawn_frequency=1.0, face_detected=True))
         many = engine.decide(E(yawn_detected=True, yawn_count=20, recent_yawn_frequency=30.0, face_detected=True))
-        # Both bounded; high frequency reaches the cap.
-        self.assertLessEqual(many.breakdown["yawn_risk"], 15.0)
+        # Repeated yawns strengthen the contribution but stay within RECENT_YAWN_MAX.
+        self.assertGreater(many.breakdown["yawn_risk"], one.breakdown["yawn_risk"])
+        self.assertLessEqual(many.breakdown["yawn_risk"], RECENT_YAWN_MAX)
         self.assertLessEqual(one.breakdown["yawn_risk"], 15.0)
 
     def test_yawn_does_not_overwhelm_prolonged_eye(self) -> None:

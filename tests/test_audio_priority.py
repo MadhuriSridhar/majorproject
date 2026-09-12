@@ -105,54 +105,67 @@ class WavHelperTests(unittest.TestCase):
 
 
 class VolumeSelectionTests(unittest.TestCase):
-    def test_master_volume_used_for_low_fatigue(self) -> None:
+    def test_alert_volume_used_for_low_fatigue(self) -> None:
         backend = AudioBackend(
             severity="LOW_FATIGUE",
             wav_path=None,
-            settings=AudioSettings(alert_volume=0.30, alarm_volume=0.30),
+            settings=AudioSettings(alert_volume=0.30, alarm_volume=0.80),
         )
         self.assertAlmostEqual(backend._volume_for("LOW_FATIGUE"), 0.30)
 
-    def test_master_volume_used_for_warning(self) -> None:
+    def test_alert_volume_used_for_alert(self) -> None:
+        backend = AudioBackend(
+            severity="ALERT",
+            wav_path=None,
+            settings=AudioSettings(alert_volume=0.30, alarm_volume=0.80),
+        )
+        self.assertAlmostEqual(backend._volume_for("ALERT"), 0.30)
+
+    def test_alarm_volume_used_for_warning(self) -> None:
         backend = AudioBackend(
             severity="WARNING",
             wav_path=None,
-            settings=AudioSettings(alert_volume=0.30, alarm_volume=0.30),
+            settings=AudioSettings(alert_volume=0.30, alarm_volume=0.80),
         )
-        self.assertAlmostEqual(backend._volume_for("WARNING"), 0.30)
+        self.assertAlmostEqual(backend._volume_for("WARNING"), 0.80)
 
-    def test_master_volume_used_for_drowsy(self) -> None:
+    def test_alarm_volume_used_for_drowsy(self) -> None:
         backend = AudioBackend(
             severity="DROWSY",
             wav_path=None,
-            settings=AudioSettings(alert_volume=0.30, alarm_volume=0.30),
+            settings=AudioSettings(alert_volume=0.30, alarm_volume=0.80),
         )
-        self.assertAlmostEqual(backend._volume_for("DROWSY"), 0.30)
+        self.assertAlmostEqual(backend._volume_for("DROWSY"), 0.80)
 
-    def test_all_severities_share_settings_volume(self) -> None:
-        settings = AudioSettings(alert_volume=0.55, alarm_volume=0.55)
-        for severity in ("LOW_FATIGUE", "ALERT", "WARNING", "DROWSY"):
-            backend = AudioBackend(
-                severity=severity,
-                wav_path=None,
-                settings=settings,
-            )
-            self.assertAlmostEqual(backend._volume_for(severity), 0.55)
+    def test_alert_and_alarm_volumes_are_independent(self) -> None:
+        settings = AudioSettings(alert_volume=0.20, alarm_volume=0.90)
+        self.assertAlmostEqual(
+            AudioBackend("LOW_FATIGUE", None, settings)._volume_for("LOW_FATIGUE"), 0.20
+        )
+        self.assertAlmostEqual(
+            AudioBackend("WARNING", None, settings)._volume_for("WARNING"), 0.90
+        )
 
     def test_volume_clamped_to_range(self) -> None:
         backend = AudioBackend(
             severity="DROWSY",
             wav_path=None,
-            settings=AudioSettings(alert_volume=-1.0, alarm_volume=-1.0),
+            settings=AudioSettings(alert_volume=-1.0, alarm_volume=5.0),
         )
-        self.assertEqual(backend._volume_for("DROWSY"), 0.0)
+        self.assertEqual(backend._volume_for("DROWSY"), 1.0)  # 5 clamped to 1
+        backend2 = AudioBackend(
+            severity="LOW_FATIGUE",
+            wav_path=None,
+            settings=AudioSettings(alert_volume=-1.0, alarm_volume=5.0),
+        )
+        self.assertEqual(backend2._volume_for("LOW_FATIGUE"), 0.0)  # -1 clamped to 0
 
-    def test_voice_volume_respects_settings_volume(self) -> None:
-        # The _speak method must set pyttsx3 volume from master Settings volume.
+    def test_voice_volume_respects_alert_volume(self) -> None:
+        # LOW_FATIGUE voice uses alert_volume (not alarm_volume).
         backend = AudioBackend(
             severity="LOW_FATIGUE",
             wav_path=None,
-            settings=AudioSettings(alert_volume=0.45, alarm_volume=0.45, voice_enabled=True),
+            settings=AudioSettings(alert_volume=0.45, alarm_volume=0.90, voice_enabled=True),
         )
         applied: list[float] = []
 
@@ -192,20 +205,20 @@ class VolumeSelectionTests(unittest.TestCase):
 
     def test_subsequent_alert_uses_updated_volume(self) -> None:
         engine = AudioEngine(
-            AudioSettings(alert_volume=0.2, alarm_volume=0.2, voice_enabled=False, sound_enabled=False)
+            AudioSettings(alert_volume=0.2, alarm_volume=0.4, voice_enabled=False, sound_enabled=False)
         )
         engine.play_alert("WARNING")
         first = engine._current
         assert first is not None
-        self.assertAlmostEqual(first._volume_for("WARNING"), 0.2)
+        self.assertAlmostEqual(first._volume_for("WARNING"), 0.4)
         engine._on_job_done("WARNING")
         engine.settings = AudioSettings(
-            alert_volume=0.9, alarm_volume=0.9, voice_enabled=False, sound_enabled=False
+            alert_volume=0.9, alarm_volume=0.8, voice_enabled=False, sound_enabled=False
         )
         engine.play_alert("WARNING")
         second = engine._current
         assert second is not None
-        self.assertAlmostEqual(second._volume_for("WARNING"), 0.9)
+        self.assertAlmostEqual(second._volume_for("WARNING"), 0.8)
         engine.shutdown()
 
 
