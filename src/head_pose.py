@@ -35,7 +35,7 @@ FALLBACK_PITCH_DOWN_DEG = 32.0
 FALLBACK_PITCH_UP_DEG = 36.0
 
 # Brief glance ignored; sustained pose becomes active; clear gradually.
-ACTIVATE_HOLD_S = 1.20
+ACTIVATE_HOLD_S = 0.45
 CLEAR_HOLD_S = 0.55
 
 

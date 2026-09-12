@@ -29,6 +29,7 @@ from alert_escalation import (
 )
 from attention_engine import AttentionEngine
 from audio_engine import AudioEngine, AudioSettings
+from alert_logging import log_alert_decision
 from settings_store import DashboardPreferences
 from distraction_monitor import DistractionMonitor
 from driving_duration import USE_DEMO_DRIVING_DURATION
@@ -43,7 +44,9 @@ from fatigue_engine import FatigueEngine
 from location_context import (
     DEMO_ZONE_LABELS,
     LocationRiskProvider,
+    ZoneTransitionTracker,
     format_location_summary,
+    format_zone_event_summary,
 )
 from mouth_features import analyze_mouth, draw_mar_mouth_landmarks
 from weather_context import WeatherContextProvider, format_weather_summary
@@ -140,6 +143,53 @@ def should_run_analysis(active: bool, camera_ok: bool, num_faces: int) -> bool:
     return active and camera_ok and num_faces == 1
 
 
+# A short deterministic grace period for transient landmark dropouts (e.g. a
+# head turn that briefly hides the face). Within this window the system keeps
+# its last valid state and shows "temporarily unavailable" instead of treating
+# the loss as monitoring shutdown or fatigue. Time-based (not frame-count based).
+FACE_LOSS_GRACE_S = 1.5
+
+
+def head_is_down(head) -> bool:
+    """True only when head pose is actively classified as looking down.
+
+    Downward head orientation compresses the apparent eye opening (EAR), so
+    eye-closure-based fatigue must not be inferred from that period.
+    """
+    if head is None:
+        return False
+    return bool(
+        getattr(head, "looking_away", False)
+        and getattr(head, "direction", "forward") == "down"
+    )
+
+
+def head_is_turned(head) -> bool:
+    """True only when head pose is actively turned left/right (not down).
+
+    A strongly turned head hides the eyes/mouth, so the face is still PRESENT
+    but its facial subfeatures are not reliably visible. This is a potential
+    distraction signal, never fatigue in itself.
+    """
+    if head is None:
+        return False
+    return bool(
+        getattr(head, "looking_away", False)
+        and getattr(head, "direction", "forward") in ("left", "right")
+    )
+
+
+def classify_face_state(
+    face_detected: bool, lost_for_s: float | None, grace_s: float
+) -> str:
+    """FACE_DETECTED | FACE_TEMPORARILY_LOST | FACE_NOT_DETECTED."""
+    if face_detected:
+        return "FACE_DETECTED"
+    if lost_for_s is not None and lost_for_s < grace_s:
+        return "FACE_TEMPORARILY_LOST"
+    return "FACE_NOT_DETECTED"
+
+
 class CameraWorker(threading.Thread):
     """
     Background thread: capture + MediaPipe + FatigueEngine.
@@ -155,6 +205,7 @@ class CameraWorker(threading.Thread):
         audio_engine: AudioEngine,
         on_status_change=None,
         settings_store: SettingsStore | None = None,
+        face_loss_grace_s: float = FACE_LOSS_GRACE_S,
     ) -> None:
         super().__init__(name="camera-worker", daemon=True)
         self.session_manager = session_manager
@@ -188,6 +239,11 @@ class CameraWorker(threading.Thread):
         self.attention_engine = AttentionEngine()
         self.location_provider = LocationRiskProvider()
         self.weather_provider = WeatherContextProvider()
+        self.zone_tracker = ZoneTransitionTracker()
+        self._last_zone_event_text = ""
+        self.face_loss_grace_s = float(face_loss_grace_s)
+        self._face_lost_since: float | None = None
+        self._last_distraction_obs = None
         self.distraction_enabled = True
         self.location_risk_enabled = True
         self.landmarker = None
@@ -215,6 +271,11 @@ class CameraWorker(threading.Thread):
         self._valid_evidence_frames = 0
         self._last_diagnostic_signature = None
         self._last_diagnostic_log_s = None
+        self.zone_tracker.reset()
+        self._last_zone_event_text = ""
+        self._face_lost_since = None
+        self._last_distraction_obs = None
+        self._last_logged_severity = "NORMAL"
         with self._context_lock:
             self._location_ctx = None
             self._weather_ctx = None
@@ -252,6 +313,27 @@ class CameraWorker(threading.Thread):
             pass
         self.location_provider.configure(mode=mode, demo_zone=demo_zone)
         self.weather_provider.configure(enabled=weather_on)
+
+    def _log_alert_decision(self, alert_result, attention, eye_state) -> None:
+        """Emit one traceable alert-decision log line (kept off the hot path)."""
+        suppressed = bool(
+            not alert_result.should_play_audio
+            and alert_result.active_severity != "NORMAL"
+        )
+        log_alert_decision(
+            severity=alert_result.active_severity,
+            reason=alert_result.reason or getattr(attention, "primary_reason", ""),
+            alertness=getattr(attention, "alertness_score", None),
+            fatigue=getattr(attention, "fatigue_score", None),
+            distraction=getattr(attention, "distraction_score", None),
+            context_urgency=getattr(attention, "context_urgency", None),
+            head_direction=getattr(attention, "head_direction", "unknown"),
+            eye_state=getattr(eye_state, "eye", "UNKNOWN"),
+            face_detected=True,
+            audio="PLAY" if alert_result.should_play_audio else "NONE",
+            suppressed=suppressed,
+            suppression_reason="same_event_cooldown" if suppressed else "",
+        )
 
     def _log_diagnostics(
         self,
@@ -425,7 +507,23 @@ class CameraWorker(threading.Thread):
 
                 session_active = self.session_manager.active
                 valid_face = should_run_analysis(session_active, self.camera_ok, num_faces)
-                warmup_ready = self._evidence_ready(now, valid_face)
+
+                # Track the face-loss grace window so a brief dropout (e.g. a
+                # head turn) does not reset monitoring or read as fatigue.
+                if face_detected:
+                    self._face_lost_since = None
+                elif self._face_lost_since is None:
+                    self._face_lost_since = now
+                lost_for = (
+                    now - self._face_lost_since if self._face_lost_since is not None else None
+                )
+                face_state = classify_face_state(face_detected, lost_for, self.face_loss_grace_s)
+                in_grace = session_active and face_state == "FACE_TEMPORARILY_LOST"
+
+                if in_grace:
+                    warmup_ready = False
+                else:
+                    warmup_ready = self._evidence_ready(now, valid_face)
 
                 # Facial feature extraction (only with exactly one face).
                 eye_state = None
@@ -454,10 +552,25 @@ class CameraWorker(threading.Thread):
                         eye_state = eyes
                         mouth_state = mouth
                 else:
-                    if session_active:
+                    if in_grace:
+                        # Temporary dropout: retain the last distraction state
+                        # instead of clearing channels or reading stale EAR.
+                        distraction_obs = self._last_distraction_obs
+                    elif session_active:
                         eye_state = self.eye_tracker.update(None, now)
                         mouth_state = self.yawn_tracker.update(None, now)
                         self.distraction_monitor.reset()
+
+                if distraction_obs is not None:
+                    self._last_distraction_obs = distraction_obs
+                hpose = distraction_obs.head if distraction_obs is not None else None
+                head_down = head_is_down(hpose)
+                head_turned = head_is_turned(hpose)
+                # Eyes/mouth are not reliably visible while the head is strongly
+                # turned or down; treat that as a PARTIAL observation, never as
+                # "eyes closed" / "mouth open" fatigue evidence.
+                eyes_not_visible = bool(head_down or head_turned)
+                mouth_not_visible = bool(head_down or head_turned)
 
                 time_ctx = get_time_context()
 
@@ -471,6 +584,15 @@ class CameraWorker(threading.Thread):
                     location_ctx = self.location_provider._unavailable("Unavailable")
                 if weather_ctx is None:
                     weather_ctx = self.weather_provider._unavailable("Unavailable")
+
+                # Zone entry/exit tracking (event semantics, never per frame).
+                zone_transition = self.zone_tracker.update(
+                    location_ctx.zone_type, location_ctx.zone_name, now
+                )
+                if zone_transition is not None:
+                    self._last_zone_event_text = format_zone_event_summary(zone_transition)
+                    if self.session_manager.active:
+                        self.session_manager.record_zone_transition(zone_transition, now)
 
                 loc_risk = (
                     float(location_ctx.risk_level or 0.0)
@@ -494,6 +616,10 @@ class CameraWorker(threading.Thread):
                         time_ctx=time_ctx,
                         driving=self.session_manager.driving_result(now),
                         face_detected=True,
+                        head_down=head_down,
+                        head_turned=head_turned,
+                        eyes_not_visible=eyes_not_visible,
+                        mouth_not_visible=mouth_not_visible,
                     )
                     decision = self.fatigue_engine.update(evidence, now)
                     fatigue_risk = (
@@ -525,6 +651,7 @@ class CameraWorker(threading.Thread):
                         alertness_score=attention.alertness_score,
                         fatigue_score=attention.fatigue_score,
                         distraction_score=attention.distraction_score,
+                        context_urgency=attention.context_urgency,
                     )
                     if alert_result.should_play_audio:
                         self.audio_engine.play_alert(
@@ -532,6 +659,15 @@ class CameraWorker(threading.Thread):
                             reason=alert_result.reason,
                             contributing_factors=alert_result.contributing_factors,
                         )
+                    # One event-level log per alert-decision state change (never
+                    # per camera frame) so the arbitration is fully traceable.
+                    log_severity = alert_result.active_severity
+                    if (
+                        alert_result.should_play_audio
+                        or log_severity != getattr(self, "_last_logged_severity", "NORMAL")
+                    ):
+                        self._last_logged_severity = log_severity
+                        self._log_alert_decision(alert_result, attention, eye_state)
                     self.session_manager.update(
                         decision,
                         now,
@@ -547,10 +683,18 @@ class CameraWorker(threading.Thread):
                         time_ctx=time_ctx,
                         driving=self.session_manager.driving_result(now),
                         face_detected=True,
+                        head_down=head_down,
+                        head_turned=head_turned,
+                        eyes_not_visible=eyes_not_visible,
+                        mouth_not_visible=mouth_not_visible,
                     )
                     self.fatigue_engine.update(evidence, now)
                     self.attention_engine.reset()
                     alert_result = self.alert_controller.update("NORMAL", now)
+                elif in_grace:
+                    # Temporary face loss within the grace window: retain the
+                    # last valid state. Reset nothing, record nothing, alarm nothing.
+                    pass
                 else:
                     # No valid fatigue assessment - reset engine state safely.
                     self.fatigue_engine.reset()
@@ -583,6 +727,7 @@ class CameraWorker(threading.Thread):
                             "multiple_faces": multiple_faces,
                             "num_faces": num_faces,
                             "driver_state": driver_state,
+                            "face_state": face_state,
                             "eye_state": eye_state,
                             "mouth_state": mouth_state,
                             "decision": decision,
@@ -590,6 +735,7 @@ class CameraWorker(threading.Thread):
                             "distraction": distraction_obs,
                             "location": location_ctx,
                             "weather": weather_ctx,
+                            "zone_event": self._last_zone_event_text,
                             "alert_result": alert_result,
                             "diagnostics": diagnostics,
                             "time_ctx": time_ctx,
@@ -1039,6 +1185,7 @@ class DrowsinessApp(tk.Tk):
         self.audio_engine = AudioEngine(AudioSettings(
             alert_volume=float(self.settings_store.get("alert_volume", 0.6)),
             alarm_volume=float(self.settings_store.get("alarm_volume", 0.7)),
+            voice_volume=float(self.settings_store.get("voice_volume", 0.85)),
             voice_enabled=bool(self.settings_store.get("voice_enabled", True)),
             sound_enabled=bool(self.settings_store.get("sound_enabled", True)),
             alert_sound=str(self.settings_store.get("alert_sound", "soft_beep_2")),
@@ -1179,9 +1326,25 @@ class DrowsinessApp(tk.Tk):
         ).pack(side="right", padx=(10, 20))
 
     def _build_main_dashboard(self, build_status_bar: bool = True) -> None:
-        main = tk.Frame(self, bg=BG)
-        main.pack(fill="both", expand=True)
-        self.scroll = main
+        viewport = tk.Frame(self, bg=BG)
+        viewport.pack(fill="both", expand=True)
+        self.scroll = viewport
+        content_canvas = tk.Canvas(viewport, bg=BG, highlightthickness=0)
+        content_scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=content_canvas.yview)
+        content_canvas.configure(yscrollcommand=content_scrollbar.set)
+        content_scrollbar.pack(side="right", fill="y")
+        content_canvas.pack(side="left", fill="both", expand=True)
+        main = tk.Frame(content_canvas, bg=BG)
+        content_window = content_canvas.create_window((0, 0), window=main, anchor="nw")
+
+        def _sync_scroll_region(_event=None) -> None:
+            content_canvas.configure(scrollregion=content_canvas.bbox("all"))
+
+        def _fit_content_width(event) -> None:
+            content_canvas.itemconfigure(content_window, width=event.width)
+
+        main.bind("<Configure>", _sync_scroll_region)
+        content_canvas.bind("<Configure>", _fit_content_width)
 
         # Top row: camera + fatigue risk + driver view.
         top = tk.Frame(main, bg=BG)
@@ -1276,27 +1439,51 @@ class DrowsinessApp(tk.Tk):
         lower.pack(fill="x", padx=12, pady=8)
 
         # Risk breakdown panel.
-        rb_panel = tk.Frame(lower, bg=BG_CARD, bd=1, highlightthickness=1, highlightbackground="#2a3040", height=185)
+        rb_panel = tk.Frame(lower, bg=BG_CARD, bd=1, highlightthickness=1, highlightbackground="#2a3040", height=210)
         rb_panel.pack(side="left", fill="both", expand=True, padx=(0, 6))
         rb_panel.pack_propagate(False)
         rb_header = tk.Frame(rb_panel, bg=BG_CARD)
         rb_header.pack(fill="x", padx=10, pady=(6, 0))
-        tk.Label(rb_header, text="RISK FACTOR BREAKDOWN", font=FONT_SMALL, bg=BG_CARD, fg=FG_MUTED).pack(side="left")
+        tk.Label(rb_header, text="ATTENTION TREND & ALERTS", font=FONT_SMALL, bg=BG_CARD, fg=FG_MUTED).pack(side="left")
         self.trend_btn = tk.Button(rb_header, text="TREND", font=FONT_SMALL, bg=ACCENT, fg="#fff", relief="flat", command=lambda: self._set_trend_mode("TREND"))
         self.trend_btn.pack(side="right", padx=(4, 0))
         self.table_btn = tk.Button(rb_header, text="TABLE", font=FONT_SMALL, bg=BG_INPUT, fg=FG, relief="flat", command=lambda: self._set_trend_mode("TABLE"))
         self.table_btn.pack(side="right")
         self.rb_content = tk.Frame(rb_panel, bg=BG_CARD)
         self.rb_content.pack(fill="both", expand=True, padx=10, pady=6)
-        self.trend_canvas = tk.Canvas(self.rb_content, bg=BG_CARD, height=120, highlightthickness=0)
+        self.trend_canvas = tk.Canvas(self.rb_content, bg=BG_CARD, height=150, highlightthickness=0)
         self.trend_canvas.pack(fill="both", expand=True)
         self.rb_table = tk.Frame(self.rb_content, bg=BG_CARD)
-        self.rb_table.pack(fill="both", expand=True)
-        self.rb_table.pack_forget()
+        # Wrap the table so wrapped rows never extend beyond the bounded panel.
+        self.rb_table_container = tk.Frame(self.rb_content, bg=BG_CARD)
+        self.rb_table_canvas = tk.Canvas(self.rb_table_container, bg=BG_CARD, highlightthickness=0)
+        self.rb_table_scroll = ttk.Scrollbar(
+            self.rb_table_container, orient="vertical", command=self.rb_table_canvas.yview
+        )
+        self.rb_table_canvas.configure(yscrollcommand=self.rb_table_scroll.set)
+        self.rb_table_scroll.pack(side="right", fill="y")
+        self.rb_table_canvas.pack(side="left", fill="both", expand=True)
+        self.rb_table = tk.Frame(self.rb_table_canvas, bg=BG_CARD)
+        self.rb_table_window = self.rb_table_canvas.create_window(
+            (0, 0), window=self.rb_table, anchor="nw"
+        )
+        self.rb_table.bind(
+            "<Configure>",
+            lambda _e: self.rb_table_canvas.configure(scrollregion=self.rb_table_canvas.bbox("all")),
+        )
+        self.rb_table_canvas.bind(
+            "<Configure>",
+            lambda _e: self.rb_table_canvas.itemconfigure(
+                self.rb_table_window, width=self.rb_table_canvas.winfo_width()
+            ),
+        )
+        self.rb_table_container.pack(fill="both", expand=True)
+        self.rb_table_container.pack_forget()
 
         # Context panel.
         self.ctx_time = self.ctx_night = self.ctx_duration = None
         self.ctx_location = self.ctx_weather = None
+        self.ctx_zone_event = None
         context_components = (
             "current_time",
             "night_context",
@@ -1305,18 +1492,17 @@ class DrowsinessApp(tk.Tk):
             "weather_context",
         )
         if any(self.prefs.is_enabled(comp) for comp in context_components):
-            ctx_panel = tk.Frame(lower, bg=BG_CARD, bd=1, highlightthickness=1, highlightbackground="#2a3040", width=280)
+            ctx_panel = tk.Frame(lower, bg=BG_CARD, bd=1, highlightthickness=1, highlightbackground="#2a3040", width=320)
             ctx_panel.pack(side="right", fill="y", padx=(6, 0))
-            ctx_panel.pack_propagate(False)
             tk.Label(ctx_panel, text="CONTEXT", font=FONT_SMALL, bg=BG_CARD, fg=FG_MUTED).pack(anchor="w", padx=10, pady=(6, 2))
             if self.prefs.is_enabled("current_time"):
-                self.ctx_time = tk.Label(ctx_panel, text="CURRENT TIME:\n--:--:--", font=FONT_BODY, bg=BG_CARD, fg=FG, justify="left")
+                self.ctx_time = tk.Label(ctx_panel, text="CURRENT TIME:\n--:--:--", font=FONT_BODY, bg=BG_CARD, fg=FG, justify="left", wraplength=285)
                 self.ctx_time.pack(anchor="w", padx=10, pady=2)
             if self.prefs.is_enabled("night_context"):
-                self.ctx_night = tk.Label(ctx_panel, text="NIGHT CONTEXT:\nINACTIVE", font=FONT_BODY, bg=BG_CARD, fg=FG, justify="left")
+                self.ctx_night = tk.Label(ctx_panel, text="NIGHT CONTEXT:\nINACTIVE", font=FONT_BODY, bg=BG_CARD, fg=FG, justify="left", wraplength=285)
                 self.ctx_night.pack(anchor="w", padx=10, pady=2)
             if self.prefs.is_enabled("driving_duration"):
-                self.ctx_duration = tk.Label(ctx_panel, text="DRIVING DURATION:\n00:00:00", font=FONT_BODY, bg=BG_CARD, fg=FG, justify="left")
+                self.ctx_duration = tk.Label(ctx_panel, text="DRIVING DURATION:\n00:00:00", font=FONT_BODY, bg=BG_CARD, fg=FG, justify="left", wraplength=285)
                 self.ctx_duration.pack(anchor="w", padx=10, pady=2)
             if self.prefs.is_enabled("location_context"):
                 self.ctx_location = tk.Label(
@@ -1326,8 +1512,19 @@ class DrowsinessApp(tk.Tk):
                     bg=BG_CARD,
                     fg=FG,
                     justify="left",
+                    wraplength=285,
                 )
                 self.ctx_location.pack(anchor="w", padx=10, pady=2)
+                # Transient zone-entry/exit line (packed only when an event exists).
+                self.ctx_zone_event = tk.Label(
+                    ctx_panel,
+                    text="",
+                    font=("Segoe UI", 9, "bold"),
+                    bg=BG_CARD,
+                    fg=AMBER,
+                    justify="left",
+                    wraplength=285,
+                )
             if self.prefs.is_enabled("weather_context"):
                 self.ctx_weather = tk.Label(
                     ctx_panel,
@@ -1336,6 +1533,7 @@ class DrowsinessApp(tk.Tk):
                     bg=BG_CARD,
                     fg=FG,
                     justify="left",
+                    wraplength=285,
                 )
                 self.ctx_weather.pack(anchor="w", padx=10, pady=2)
 
@@ -1376,6 +1574,15 @@ class DrowsinessApp(tk.Tk):
             relief="flat",
             command=self._stop_driving,
         ).pack(side="right", padx=12, pady=6)
+        tk.Button(
+            self.status_bar,
+            text="[ EXPORT PDF ]",
+            font=FONT_SMALL,
+            bg=ACCENT,
+            fg="#fff",
+            relief="flat",
+            command=self._export_pdf,
+        ).pack(side="right", padx=6, pady=6)
         self._apply_dashboard_status_preferences()
 
     def _set_trend_mode(self, mode: str) -> None:
@@ -1387,7 +1594,7 @@ class DrowsinessApp(tk.Tk):
             self.trend_btn.configure(bg=BG_INPUT, fg=FG)
             self.table_btn.configure(bg=ACCENT, fg="#fff")
         if self.current_screen == "dashboard":
-            self._update_risk_breakdown(self._last_decision)
+            self._update_alertness_history_view()
 
     def _build_summary_screen(self, stats) -> None:
         self._destroy_dashboard_ui()
@@ -1522,12 +1729,13 @@ class DrowsinessApp(tk.Tk):
         self.camera_worker.start_camera()
 
     def _export_pdf(self) -> None:
-        if self._summary_stats is None:
+        stats = self._summary_stats or self.session_manager.stats
+        if not stats.session_id:
             return
         # Run PDF generation in a background thread to avoid blocking.
         def _do():
             try:
-                path = export_pdf(self._summary_stats)
+                path = export_pdf(stats)
                 self.after(0, lambda: messagebox.showinfo("PDF Export", f"PDF saved to:\n{path}"))
             except Exception as exc:
                 self.after(0, lambda: messagebox.showerror("PDF Export Error", str(exc)))
@@ -1652,6 +1860,7 @@ class DrowsinessApp(tk.Tk):
         time_ctx = data["time_ctx"]
         multiple = data["multiple_faces"]
         face_detected = data["face_detected"]
+        face_state = data.get("face_state", "FACE_DETECTED")
         driver_state = data["driver_state"]
 
         # Camera display: stable 16:9 preview that preserves aspect ratio and
@@ -1675,6 +1884,8 @@ class DrowsinessApp(tk.Tk):
             overlay = "SESSION INACTIVE"
         elif multiple:
             overlay = "MULTIPLE FACES"
+        elif face_state == "FACE_TEMPORARILY_LOST":
+            overlay = "FACE TEMPORARILY UNAVAILABLE"
         elif not face_detected:
             overlay = "FACE NOT DETECTED"
         else:
@@ -1698,10 +1909,16 @@ class DrowsinessApp(tk.Tk):
                 text=f"CAMERA: {'CONNECTED' if data['camera_ok'] else 'DISCONNECTED'}",
                 fg=RED if not data['camera_ok'] else FG,
             )
-        self.status_face.configure(
-            text=f"FACE: {'DETECTED' if face_detected else 'NOT DETECTED'}",
-            fg=GREEN if face_detected else RED,
-        )
+        if face_state == "FACE_TEMPORARILY_LOST":
+            status_face_text = "FACE: TEMPORARILY UNAVAILABLE"
+            status_face_color = AMBER
+        elif face_detected:
+            status_face_text = "FACE: DETECTED"
+            status_face_color = GREEN
+        else:
+            status_face_text = "FACE: NOT DETECTED"
+            status_face_color = RED
+        self.status_face.configure(text=status_face_text, fg=status_face_color)
         self.status_system.configure(
             text="SYSTEM: RUNNING" if getattr(self, "_running", False) else "SYSTEM: STOPPED",
             fg=GREEN if getattr(self, "_running", False) else GRAY,
@@ -1750,6 +1967,12 @@ class DrowsinessApp(tk.Tk):
             if self.risk_reason is not None:
                 self.risk_reason.configure(text="")
             self._draw_risk_bar(0, GRAY)
+        elif face_state == "FACE_TEMPORARILY_LOST":
+            # Keep the last valid alertness value visible; only update the status.
+            if self.risk_status is not None:
+                self.risk_status.configure(text="FACE TEMPORARILY UNAVAILABLE", fg=GRAY)
+            if self.risk_reason is not None:
+                self.risk_reason.configure(text="")
         elif not face_detected:
             if self.risk_value is not None:
                 self.risk_value.configure(text="--", fg=GRAY)
@@ -1853,6 +2076,13 @@ class DrowsinessApp(tk.Tk):
                 self.ctx_weather.configure(text=format_weather_summary(weather_ctx))
             else:
                 self.ctx_weather.configure(text="WEATHER:\nUnavailable")
+        if getattr(self, "ctx_zone_event", None) is not None:
+            zone_event_text = data.get("zone_event") or ""
+            if zone_event_text:
+                self.ctx_zone_event.configure(text=zone_event_text)
+                self.ctx_zone_event.pack(anchor="w", padx=10, pady=0)
+            else:
+                self.ctx_zone_event.pack_forget()
 
         # Alertness trend / event table are driven by the recorded session model.
         self._update_alertness_history_view()
@@ -1899,7 +2129,7 @@ class DrowsinessApp(tk.Tk):
 
         if self._trend_mode == "TABLE":
             self.trend_canvas.pack_forget()
-            self.rb_table.pack(fill="both", expand=True)
+            self.rb_table_container.pack(fill="both", expand=True)
             # Use the latest available sample from history (or current decision
             # if no history yet) so TABLE matches TREND.
             if samples:
@@ -1936,7 +2166,7 @@ class DrowsinessApp(tk.Tk):
             self.rb_table.columnconfigure(0, weight=1)
             self.rb_table.columnconfigure(1, weight=0)
         else:
-            self.rb_table.pack_forget()
+            self.rb_table_container.pack_forget()
             self.trend_canvas.pack(fill="both", expand=True)
 
             # Current factor values (from latest history sample or decision).
@@ -2096,7 +2326,7 @@ class DrowsinessApp(tk.Tk):
 
         if self._trend_mode == "TABLE":
             self.trend_canvas.pack_forget()
-            self.rb_table.pack(fill="both", expand=True)
+            self.rb_table_container.pack(fill="both", expand=True)
             headers = ("TIME", "EVENT", "SEVERITY", "PRIMARY REASON", "ALERTNESS", "ACTION")
             for col, header in enumerate(headers):
                 tk.Label(self.rb_table, text=header, font=FONT_SMALL, bg=BG_CARD, fg=ACCENT, anchor="w").grid(
@@ -2138,51 +2368,81 @@ class DrowsinessApp(tk.Tk):
                 self.rb_table.columnconfigure(col, weight=1 if col in (3, 5) else 0)
             return
 
-        self.rb_table.pack_forget()
+        self.rb_table_container.pack_forget()
         self.trend_canvas.pack(fill="both", expand=True)
-        self.trend_canvas.create_text(10, 8, anchor="nw", text="ALERTNESS TREND", fill=FG_MUTED, font=FONT_SMALL)
+        self.trend_canvas.create_text(10, 8, anchor="nw", text="ATTENTION TREND", fill=FG_MUTED, font=FONT_SMALL)
         if len(history) < 2:
             self.trend_canvas.create_text(10, 34, anchor="nw", text="CALIBRATING / COLLECTING DATA...", fill=FG_MUTED, font=FONT_BODY)
             return
 
-        left = 10
-        top = 28
-        width = max(180, self.trend_canvas.winfo_width() - 20)
-        height = max(45, int(self.trend_canvas.cget("height")) - 50)
+        cw = max(180, self.trend_canvas.winfo_width() or 400)
+        ch = max(60, int(self.trend_canvas.cget("height")) or 150)
+        left = 46
+        top = 30
+        width = max(120, cw - left - 16)
+        height = max(40, ch - top - 34)
         start = history[0].timestamp_s
         span = max(1.0, history[-1].timestamp_s - start)
+
+        def _x(ts: float) -> float:
+            return left + ((ts - start) / span) * width
+
+        def _y(val: float) -> float:
+            return top + (1.0 - min(100.0, max(0.0, float(val))) / 100.0) * height
+
+        # Axes.
         self.trend_canvas.create_line(left, top, left, top + height, fill="#3a4254")
-        self.trend_canvas.create_line(left, top + height, left + width, top + height, fill="#3a4254")
-        points: list[tuple[float, float]] = []
-        for sample in history:
-            if sample.alertness is None:
-                points = []
-                continue
-            x = left + ((sample.timestamp_s - start) / span) * width
-            y = top + (1.0 - sample.alertness / 100.0) * height
-            if points:
-                self.trend_canvas.create_line(points[-1][0], points[-1][1], x, y, fill=GREEN, width=3)
-            points.append((x, y))
-        if points:
-            x, y = points[-1]
-            self.trend_canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill=GREEN, outline="")
-        for value in (100, 50, 0):
-            y = top + (1.0 - value / 100.0) * height
-            self.trend_canvas.create_text(left + 2, y, anchor="sw" if value else "nw", text=str(value), fill=FG_MUTED, font=("Segoe UI", 7))
-        stats = self.session_manager.stats
-        self.trend_canvas.create_text(
-            left + 55,
-            top + height + 10,
-            anchor="nw",
-            text=(
-                f"Avg {stats.average_alertness:.0f}   Min {stats.minimum_alertness:.0f}   "
-                f"Max {stats.maximum_alertness:.0f}   Safe {stats.time_safe_s:.0f}s   "
-                f"Moderate {stats.time_moderate_s:.0f}s   High {stats.time_high_s:.0f}s   "
-                f"Critical {stats.time_critical_s:.0f}s"
-            ),
-            fill=FG_MUTED,
-            font=("Segoe UI", 8),
+        self.trend_canvas.create_line(
+            left, top + height, left + width, top + height, fill="#3a4254"
         )
+
+        # Y-axis labels (0-100) — one shared scale for all metrics.
+        for value in (100, 75, 50, 25, 0):
+            y = _y(float(value))
+            self.trend_canvas.create_text(
+                left - 4, y, anchor="e", text=str(value), fill=FG_MUTED,
+                font=("Segoe UI", 7),
+            )
+
+        # Legend (drawn first so series lines sit above it).
+        series = [
+            ("Alertness", "alertness", GREEN, 3),
+            ("Fatigue", "fatigue", ORANGE, 2),
+            ("Distraction", "distraction", RED, 2),
+            ("Context", "environmental_risk", ACCENT, 1),
+        ]
+        legend_x = left
+        legend_y = top + height + 16
+        for label, _key, color, _w in series:
+            self.trend_canvas.create_rectangle(
+                legend_x, legend_y, legend_x + 8, legend_y + 8, fill=color, outline=""
+            )
+            self.trend_canvas.create_text(
+                legend_x + 12, legend_y + 4, anchor="w", text=label,
+                fill=FG_MUTED, font=("Segoe UI", 7),
+            )
+            legend_x += 16 + len(label) * 5 + 12
+
+        # Draw each series as broken lines (None breaks).
+        for _label, key, color, width_l in series:
+            pts: list[tuple[float, float]] = []
+            for sample in history:
+                val = getattr(sample, key, None)
+                if val is None:
+                    pts = []
+                    continue
+                x = _x(sample.timestamp_s)
+                y = _y(float(val))
+                if pts:
+                    self.trend_canvas.create_line(
+                        pts[-1][0], pts[-1][1], x, y, fill=color, width=width_l
+                    )
+                pts.append((x, y))
+            if pts:
+                x, y = pts[-1]
+                self.trend_canvas.create_oval(
+                    x - 2, y - 2, x + 2, y + 2, fill=color, outline=""
+                )
 
     def _severity_glow_color(self, severity: str) -> str:
         """Glow/accent color for the alert popup by severity."""
@@ -2331,6 +2591,20 @@ class DrowsinessApp(tk.Tk):
                 self._drowsy_countdown = countdown_label
             else:
                 self._alert_countdown = countdown_label
+
+            # Resize the popup to fit its (possibly wrapped) content so the
+            # title, risk, reason, and timer are never clipped (PART 14).
+            try:
+                card.update_idletasks()
+                content_h = max(1, card.winfo_reqheight())
+                fit_inner_h = max(inner_h, content_h + 16)
+                fit_outer_h = max(outer_h, fit_inner_h + 60)
+                card.place_configure(height=fit_inner_h)
+                panel.place_configure(height=fit_inner_h)
+                glow_ring.place_configure(height=fit_inner_h + 10)
+                self.alert_overlay.place_configure(height=fit_outer_h)
+            except Exception:
+                pass
         else:
             if severity == "DROWSY" and getattr(self, "_drowsy_countdown", None) is not None:
                 self._drowsy_countdown.configure(text=f"TIMER: {remaining}")

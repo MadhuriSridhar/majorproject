@@ -43,6 +43,13 @@ EPISODE_COOLDOWN_S = 5.0
 # Severity priority (higher wins).
 SEVERITY_PRIORITY = {"NORMAL": 0, "LOW_FATIGUE": 1, "ALERT": 2, "WARNING": 3, "DROWSY": 4}
 
+# Context urgency bounds. Context urgency scales the per-severity audio cooldown
+# ONLY: lower (more urgent) => shorter cooldown => an existing alert may repeat
+# sooner under genuinely high-risk conditions. It never changes severity and
+# never creates an alert by itself. 1.0 = normal (no effect).
+CONTEXT_URGENCY_NORMAL = 1.0
+CONTEXT_URGENCY_MIN = 0.5
+
 
 @dataclass(frozen=True)
 class AlertEscalationResult:
@@ -117,6 +124,7 @@ class AlertEscalationController:
         self._episode_reason = ""
         self._episode_factors: tuple[str, ...] = ()
         self._last_update_s: float | None = None
+        self._context_urgency = CONTEXT_URGENCY_NORMAL
 
     def reset(self) -> None:
         """Reset all alert state (new session / recovery)."""
@@ -159,6 +167,15 @@ class AlertEscalationController:
             return self.drowsy_cooldown_s
         return 0.0
 
+    def _effective_cooldown_for(self, severity: str) -> float:
+        """Cooldown scaled by the current context urgency.
+
+        A high-risk context (urgency < 1.0) shortens the cooldown so an
+        existing alert becomes eligible to repeat sooner. Normal context
+        (urgency = 1.0) leaves the configured cooldown unchanged.
+        """
+        return self._cooldown_for(severity) * self._context_urgency
+
     def _display_duration_for(self, severity: str) -> float:
         if severity == "LOW_FATIGUE":
             return self.low_fatigue_display_s
@@ -176,7 +193,7 @@ class AlertEscalationController:
             return True
         if self._last_audio_time_s is None:
             return True
-        return (now_s - self._last_audio_time_s) >= self._cooldown_for(severity)
+        return (now_s - self._last_audio_time_s) >= self._effective_cooldown_for(severity)
 
     def _global_gap_ok(self, severity: str, now_s: float) -> bool:
         """Enforce a minimum gap between different audio alerts.
@@ -201,6 +218,7 @@ class AlertEscalationController:
         alertness_score: float | None = None,
         fatigue_score: float | None = None,
         distraction_score: float | None = None,
+        context_urgency: float = 1.0,
     ) -> AlertEscalationResult:
         """
         Feed the latest attention severity and a monotonic timestamp.
@@ -216,6 +234,13 @@ class AlertEscalationController:
         score = float(alertness_score if alertness_score is not None else 0.0)
         fatigue = float(fatigue_score if fatigue_score is not None else 0.0)
         distraction = float(distraction_score if distraction_score is not None else 0.0)
+        self._context_urgency = max(
+            CONTEXT_URGENCY_MIN,
+            min(
+                CONTEXT_URGENCY_NORMAL,
+                float(context_urgency if context_urgency is not None else 1.0),
+            ),
+        )
 
         prev = self._current_severity
         self._last_update_s = now_s

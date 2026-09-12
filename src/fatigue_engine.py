@@ -97,6 +97,10 @@ class FatigueEvidence:
     driving_duration_risk: bool = False
     driving_duration_seconds: float = 0.0
     face_detected: bool = True
+    head_down: bool = False
+    head_turned: bool = False
+    eyes_not_visible: bool = False
+    mouth_not_visible: bool = False
     blink_rate: float | None = None
     recent_blink_rate: float | None = None
     recent_yawn_frequency: float | None = None
@@ -310,6 +314,21 @@ class FatigueEngine:
             BLINK_ANOMALY_MAX, max(0.0, self._recent_blink_evidence)
         )
 
+    def _eyes_closed_valid(self, evidence: FatigueEvidence) -> bool:
+        """True only when eye-closure evidence comes from reliably visible eyes.
+
+        Eye-closure fatigue must come from genuine, measurable eye closure. A
+        turned/down head — or eyes explicitly reported as not visible — must
+        never be read as "eyes closed". These are three distinct states:
+        EYES_CLOSED, EYES_NOT_VISIBLE, and FACE_NOT_DETECTED.
+        """
+        return bool(
+            evidence.prolonged_eye_closure
+            and not evidence.head_down
+            and not evidence.head_turned
+            and not evidence.eyes_not_visible
+        )
+
     def compute_score(self, evidence: FatigueEvidence) -> tuple[int | None, tuple[str, ...]]:
         """Compute current-evidence score and reasons from the authoritative raw-risk breakdown."""
         if not evidence.face_detected:
@@ -322,24 +341,35 @@ class FatigueEngine:
 
         self._had_face = True
 
+        # Eye-closure fatigue is valid ONLY when the eyes are actually visible
+        # and reliably measured. A turned/down head — or eyes explicitly marked
+        # not-visible — must never be read as "eyes closed". Missing/occluded
+        # eyes and a missing face are distinct from real eye closure.
+        eyes_closed_valid = self._eyes_closed_valid(evidence)
+        eyes_not_visible = bool(evidence.prolonged_eye_closure and not eyes_closed_valid)
+
         breakdown = self._risk_breakdown(evidence)
         score = int(round(min(100.0, breakdown["total_risk"])))
         reasons: list[str] = []
 
-        if evidence.prolonged_eye_closure:
+        if eyes_closed_valid:
             if evidence.current_eye_closure_seconds > 0:
                 reasons.append(
                     f"Prolonged eye closure ({evidence.current_eye_closure_seconds:.1f}s)"
                 )
             else:
                 reasons.append("Prolonged eye closure")
+        elif eyes_not_visible:
+            # Distinguish "eyes not visible" from "eyes closed": no fatigue is
+            # credited from landmarks hidden by head orientation.
+            reasons.append("Eyes not visible (head orientation)")
 
         if evidence.blink_rate is not None and evidence.blink_rate > 0:
             reasons.append("Abnormal blink behaviour")
         elif self._recent_blink_evidence > 0:
             reasons.append("Recent abnormal blink behaviour")
 
-        if evidence.yawn_detected or evidence.recent_yawn_frequency:
+        if (evidence.yawn_detected or evidence.recent_yawn_frequency) and not evidence.mouth_not_visible:
             reasons.append("Yawning detected")
         elif self._recent_yawn_evidence > 0:
             reasons.append("Recent yawning")
@@ -353,11 +383,11 @@ class FatigueEngine:
         if not reasons:
             reasons.append("Eyes normal")
 
-        if evidence.prolonged_eye_closure and evidence.night_context and evidence.driving_duration_risk:
+        if eyes_closed_valid and evidence.night_context and evidence.driving_duration_risk:
             reasons.append("Prolonged eye closure + night + extended driving")
-        elif evidence.prolonged_eye_closure and evidence.night_context:
+        elif eyes_closed_valid and evidence.night_context:
             reasons.append("Prolonged eye closure + night context")
-        elif evidence.prolonged_eye_closure and evidence.driving_duration_risk:
+        elif eyes_closed_valid and evidence.driving_duration_risk:
             reasons.append("Prolonged eye closure + extended driving")
 
         deduped: list[str] = []
@@ -402,7 +432,11 @@ class FatigueEngine:
                 "total_risk": 0.0,
             }
 
-        eye_risk = float(self.weight_prolonged) if evidence.prolonged_eye_closure else 0.0
+        eye_risk = (
+            float(self.weight_prolonged)
+            if self._eyes_closed_valid(evidence)
+            else 0.0
+        )
 
         blink_risk = 0.0
         if evidence.blink_rate is not None and evidence.blink_rate > 0:
@@ -417,9 +451,13 @@ class FatigueEngine:
         # Repeated yawns accumulate as decaying recent evidence and may grow the
         # contribution up to RECENT_YAWN_MAX, but never beyond it.
         yawn_risk = 0.0
-        if evidence.yawn_detected:
+        if evidence.yawn_detected and not evidence.mouth_not_visible:
             yawn_risk = float(self.weight_yawn)
-        if evidence.recent_yawn_frequency is not None and evidence.recent_yawn_frequency > 0:
+        if (
+            evidence.recent_yawn_frequency is not None
+            and evidence.recent_yawn_frequency > 0
+            and not evidence.mouth_not_visible
+        ):
             freq_risk = min(float(self.weight_yawn), evidence.recent_yawn_frequency * 3.0)
             yawn_risk = max(yawn_risk, freq_risk)
         # Decaying recent-yawn evidence (repeated yawns strengthen support).

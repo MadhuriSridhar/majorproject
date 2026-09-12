@@ -183,12 +183,12 @@ class GeofenceTests(unittest.TestCase):
         self.assertEqual(ctx.zone_name, "School")
         self.assertEqual(ctx.risk_level, 70.0)
 
-    def test_provider_no_geofence_is_normal_road(self) -> None:
+    def test_provider_no_geofence_is_baseline_no_zone(self) -> None:
         provider = LocationRiskProvider(mode="gps", update_interval_s=0.0)
         provider._geofences = []
         ctx = provider._context_for_coordinates(12.9716, 77.5946, "gps", "GPS fix")
         self.assertEqual(ctx.zone_type, "none")
-        self.assertEqual(ctx.zone_name, "Normal Road")
+        self.assertEqual(ctx.zone_name, "No configured high-risk zone")
         self.assertEqual(ctx.risk_level, 5.0)
 
 

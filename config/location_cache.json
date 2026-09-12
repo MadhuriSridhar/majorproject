@@ -3,8 +3,8 @@
   "longitude": 77.591,
   "place_name": "Bengaluru, Karnataka, India",
   "zone_type": "none",
-  "zone_name": "Normal Road",
+  "zone_name": "No configured high-risk zone",
   "risk_level": 5.0,
   "source": "ip",
-  "updated_at": 1789196797.8011117
+  "updated_at": 1789222946.869184
 }

@@ -25,6 +25,35 @@ LOCATION_CONTEXT_GAIN = 0.22
 WEATHER_CONTEXT_GAIN = 0.20
 CONTEXT_MAX_SOFT = 18.0
 
+# Context urgency (deterministic, ordering-only modifier).
+#
+# Context NEVER creates an alert by itself. It only shortens the cooldown /
+# speeds the escalation of an EXISTING behavioral alert when the external
+# conditions are genuinely high-risk. 1.0 = normal context (no effect); lower
+# values mean more urgent. Bounded so it can never drive the system beyond
+# safe limits.
+CONTEXT_URGENCY_NORMAL = 1.0
+CONTEXT_URGENCY_MIN = 0.5
+CONTEXT_URGENCY_MAX_REDUCTION = CONTEXT_URGENCY_NORMAL - CONTEXT_URGENCY_MIN
+
+# A context axis only counts as "high-risk" at/above these risk scores.
+CONTEXT_LOCATION_HIGH_RISK = 40.0
+CONTEXT_WEATHER_HIGH_RISK = 40.0
+
+# Maximum urgency reduction contributed by each axis (risk=100 yields the gain).
+LOCATION_URGENCY_GAIN = 0.25
+WEATHER_URGENCY_GAIN = 0.20
+
+# Fixed urgency contribution for a verified high-risk zone type. Only applied
+# for genuinely risky zones; "none" (normal road) contributes nothing.
+ZONE_URGENCY = {
+    "school": 0.15,
+    "construction": 0.12,
+    "sharp_turn": 0.15,
+    "highway": 0.05,
+    "other": 0.08,
+}
+
 # Level bands.
 SAFE_MAX = 24
 MODERATE_MAX = 49
@@ -72,6 +101,7 @@ class AttentionDecision:
     primary_reason: str
     distraction_primary: str
     face_ok: bool
+    distraction_type: str = "none"
     alertness_score: float = 100.0
     fatigue_score: float = 0.0
     distraction_score: float = 0.0
@@ -82,6 +112,7 @@ class AttentionDecision:
     safe_stop: bool = False
     recommendation: str = ""
     head_direction: str = "unknown"
+    context_urgency: float = 1.0
 
 
 def risk_level_from_score(score: float | None) -> str:
@@ -169,6 +200,43 @@ def apply_context_boost(
         boost += 14.0
 
     return float(min(100.0, base + boost))
+
+
+def context_urgency_from(
+    location_risk: float,
+    weather_risk: float,
+    zone_type: str = "none",
+) -> float:
+    """Deterministic context urgency modifier (1.0 = normal, lower = more urgent).
+
+    Derived from location risk, weather risk, and zone type. Returns exactly
+    1.0 when no high-risk context is present, and reverts to 1.0 as soon as the
+    high-risk context disappears. The result is clamped to
+    ``[CONTEXT_URGENCY_MIN, CONTEXT_URGENCY_NORMAL]`` so it can never exceed
+    safe bounds.
+
+    This value is an *ordering* modifier for alert escalation (shorter
+    cooldown / faster escalation). It does not raise the raw risk score and can
+    never create a fatigue or distraction claim on its own.
+    """
+    loc = max(0.0, min(100.0, float(location_risk or 0.0)))
+    wx = max(0.0, min(100.0, float(weather_risk or 0.0)))
+    zone = (zone_type or "none").strip().lower()
+
+    reduction = 0.0
+    if loc >= CONTEXT_LOCATION_HIGH_RISK:
+        reduction += LOCATION_URGENCY_GAIN * (
+            (loc - CONTEXT_LOCATION_HIGH_RISK) / (100.0 - CONTEXT_LOCATION_HIGH_RISK)
+        )
+    if wx >= CONTEXT_WEATHER_HIGH_RISK:
+        reduction += WEATHER_URGENCY_GAIN * (
+            (wx - CONTEXT_WEATHER_HIGH_RISK) / (100.0 - CONTEXT_WEATHER_HIGH_RISK)
+        )
+    if zone in ZONE_URGENCY:
+        reduction += ZONE_URGENCY[zone]
+
+    reduction = min(CONTEXT_URGENCY_MAX_REDUCTION, reduction)
+    return float(max(CONTEXT_URGENCY_MIN, CONTEXT_URGENCY_NORMAL - reduction))
 
 
 class AttentionEngine:
@@ -338,6 +406,7 @@ class AttentionEngine:
                 alert_severity="NORMAL",
                 primary_reason="No valid face",
                 distraction_primary="none",
+                distraction_type="none",
                 face_ok=False,
                 location_risk=0.0,
                 weather_risk=0.0,
@@ -354,9 +423,11 @@ class AttentionEngine:
         wx = max(0.0, min(100.0, float(weather_risk or 0.0)))
         zone = str(location_zone or "none")
         wx_cond = str(weather_condition or "unknown")
+        context_urgency = context_urgency_from(loc, wx, zone)
         head_dir = "unknown"
         if distraction is not None and distraction.head is not None:
             head_dir = str(distraction.head.direction or "unknown")
+        dist_type = getattr(distraction, "distraction_type", "none") if distraction is not None else "none"
 
         distraction_duration_s = 0.0
         if distraction is not None:
@@ -403,12 +474,12 @@ class AttentionEngine:
                 else:
                     reason = "Fatigue risk increasing"
             elif d >= loc and d >= wx and dist_primary != "none":
-                if dist_primary == "looking_down":
-                    reason = "Sustained attention away from the road"
-                elif dist_primary.startswith("head_turn"):
-                    reason = "Head direction away from the road"
-                elif dist_primary == "passenger_side":
-                    reason = "Extended lateral attention"
+                if dist_type == "downward":
+                    reason = "Sustained downward distraction away from the road"
+                elif dist_type == "passenger_conversation":
+                    reason = "Sustained passenger-side distraction away from the road with talking activity"
+                elif dist_type == "head_turn":
+                    reason = "Sustained head-turn distraction away from the road"
                 else:
                     reason = "Distraction risk elevated"
             elif loc >= wx and loc >= 40.0:
@@ -441,6 +512,7 @@ class AttentionEngine:
             alert_severity=alert,
             primary_reason=reason,
             distraction_primary=dist_primary,
+            distraction_type=dist_type,
             face_ok=True,
             alertness_score=alertness_score,
             fatigue_score=f,
@@ -452,4 +524,5 @@ class AttentionEngine:
             safe_stop=safe_stop,
             recommendation=recommendation,
             head_direction=head_dir,
+            context_urgency=context_urgency,
         )

@@ -415,6 +415,22 @@ counts, risk-factor breakdown, and a sampled risk trend.
   (latitude, longitude, radius, zone type, name, risk level). The dataset is
   empty by default — the app never presents arbitrary coordinates as real
   safety zones. See `config/geofences.example.json` for the schema.
+- **Populating the geofence file (OpenStreetMap / Overpass):** run
+  `python tools/build_geofences.py --south ... --west ... --north ... --east ...`
+  to copy already-mapped OpenStreetMap features into `config/geofences.json`
+  for a bounding box you choose. Default categories: `school` (school /
+  kindergarten / college / university) and `construction` (landuse/highway =
+  construction). `sharp_turn` / `highway` zones are **not** auto-generated
+  (OSM does not expose road-curve geometry as simple point features) — add such
+  zones manually with coordinates you verify. The script only copies mapped
+  data; it never invents zones.
+- **Empty geofence file = honest baseline.** With `config/geofences.json` empty
+  (or no matching zone), the UI shows **"No configured high-risk zone"** and
+  **"Location risk: Baseline"** — never a "verified safe road" claim.
+- **Zone entry/exit is an event, not a repeated message.** Remaining inside a
+  zone is one episode; the system emits a single entry event and a single exit
+  event (`ZoneTransitionTracker`), shown as a compact line in the UI and counted
+  in the session summary.
 - **Weather:** Open-Meteo (no API key), throttled and cached, with a safe
   neutral fallback when unavailable. Precipitation, visibility, wind, and rain
   probability are mapped to an environmental risk.
@@ -654,7 +670,37 @@ device.
 
 ## 24. Change Log
 
-**Current update — neuro-symbolic attention + stabilization pass:**
+**Current update — down-gaze / face-loss separation:**
+
+- **Looking down is not fatigue:** `FatigueEngine` now suppresses eye-closure
+  fatigue evidence while the head is actively classified as looking down
+  (downward head orientation compresses the apparent eye opening / EAR). Downward
+  orientation still contributes as distraction via the existing `looking_down`
+  channel — never as a fatigue diagnosis.
+- **Face-loss grace period:** a brief landmark dropout (e.g. during a head turn)
+  keeps the last valid state for a short, time-based grace window and shows
+  "Face temporarily unavailable" instead of resetting the fatigue/attention
+  engines, recording no-face samples, or emitting a NORMAL/fatigue alert.
+  Prolonged absence still surfaces as monitoring-unavailable.
+- **Tests:** added `tests/test_face_loss_and_head_down.py`.
+
+**Previous update — GPS / weather / zone context audit + honest zone handling:**
+
+- **Honest empty-geofence wording:** with no configured/matching zone the UI now
+  reports "No configured high-risk zone" and "Location risk: Baseline" instead
+  of a neutral "Normal Road" label that could imply a verified-safe road.
+- **Zone entry/exit tracking:** `ZoneTransitionTracker` emits one entry event on
+  entering a configured zone and one exit event on leaving (no per-frame spam);
+  events are recorded in the session (entry + exit counts) and shown in the UI.
+- **Geofence population workflow:** added `tools/build_geofences.py`
+  (OpenStreetMap / Overpass) plus `docs/ARCHITECTURE.md` documenting the real
+  runtime flow.
+- **Context panel clipping fix:** the CONTEXT card no longer clips its content.
+- **Tests:** added `tests/test_zone_transitions.py` (zone entry/exit, honest
+  empty-geofence wording, geofence matching + malformed fallback, coordinates /
+  IP fallback passthrough, context reaching the attention engine).
+
+**Previous update — neuro-symbolic attention + stabilization pass:**
 
 - **Independent volumes restored:** `alert_volume` (LOW FATIGUE / ALERT sound +
   voice) and `alarm_volume` (WARNING / DROWSY sound + voice) are separate

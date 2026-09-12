@@ -56,6 +56,24 @@ class AlertnessSample:
     primary_reason: str
 
 
+def trend_series(alertness_history: list[AlertnessSample]) -> dict[str, list[float | None]]:
+    """Split sampled history into aligned, graph-ready multi-series data.
+
+    Returns a dict with parallel lists keyed by ``x`` (timestamps, seconds),
+    ``alertness`` (0-100, higher = better), ``fatigue`` (0-100 risk),
+    ``distraction`` (0-100 risk), and ``environmental`` (0-100 context risk).
+    ``None`` entries mark a missing sample so a plot can break the line instead
+    of fabricating a value.
+    """
+    return {
+        "x": [s.timestamp_s for s in alertness_history],
+        "alertness": [s.alertness for s in alertness_history],
+        "fatigue": [s.fatigue for s in alertness_history],
+        "distraction": [s.distraction for s in alertness_history],
+        "environmental": [s.environmental_risk for s in alertness_history],
+    }
+
+
 @dataclass
 class AlertEvent:
     """One continuous alert episode, including any later escalation."""
@@ -105,6 +123,8 @@ class SessionStats:
     fatigue_event_count: int = 0
     recovery_event_count: int = 0
     high_risk_zone_event_count: int = 0
+    zone_exit_event_count: int = 0
+    zone_transitions: list = field(default_factory=list)
     average_distraction: float = 0.0
     average_environmental_risk: float = 0.0
 
@@ -134,7 +154,6 @@ class SessionManager:
         self._distraction_sum = 0.0
         self._environment_sum = 0.0
         self._last_alertness_severity = "SAFE"
-        self._last_zone_event = False
         self._active_alert_event: AlertEvent | None = None
 
     @property
@@ -174,7 +193,6 @@ class SessionManager:
         self._distraction_sum = 0.0
         self._environment_sum = 0.0
         self._last_alertness_severity = "SAFE"
-        self._last_zone_event = False
         self._active_alert_event = None
         return self._stats.session_id
 
@@ -293,6 +311,32 @@ class SessionManager:
             if len(series) > MAX_RISK_HISTORY:
                 self._stats.risk_factor_history[key] = series[-MAX_RISK_HISTORY:]
 
+    def record_zone_transition(self, transition, now_s: float | None = None) -> None:
+        """Record one zone entry/exit/change event (event semantics, not per frame).
+
+        `transition` is a ZoneTransition (any object exposing .event / .zone_type /
+        .zone_name). Values are read via getattr so this module stays decoupled
+        from location_context.
+        """
+        if not self._active:
+            return
+        now = now_s if now_s is not None else time.monotonic()
+        event = str(getattr(transition, "event", "enter"))
+        if event == "enter":
+            self._stats.high_risk_zone_event_count += 1
+        elif event == "exit":
+            self._stats.zone_exit_event_count += 1
+        self._stats.zone_transitions.append(
+            {
+                "time_s": now,
+                "event": event,
+                "zone_type": str(getattr(transition, "zone_type", "") or ""),
+                "zone_name": str(getattr(transition, "zone_name", "") or ""),
+                "from_zone_name": str(getattr(transition, "from_zone_name", "") or ""),
+                "to_zone_name": str(getattr(transition, "to_zone_name", "") or ""),
+            }
+        )
+
     def update(self, decision, now_s: float | None = None, attention=None, alert_result=None) -> None:
         """
         Record one FatigueDecision sample into the session.
@@ -370,13 +414,9 @@ class SessionManager:
                 self._stats.fatigue_event_count += 1
             if self._last_alertness_severity in ("MODERATE", "HIGH", "CRITICAL") and attention.level == "SAFE":
                 self._stats.recovery_event_count += 1
-            zone_event = (
-                str(getattr(attention, "location_zone", "none")) not in ("none", "", "unknown")
-                and float(getattr(attention, "location_risk", 0.0)) >= 40.0
-            )
-            if zone_event and not self._last_zone_event:
-                self._stats.high_risk_zone_event_count += 1
-            self._last_zone_event = zone_event
+            # Zone entry/exit events are recorded via record_zone_transition()
+            # (driven by the camera worker's ZoneTransitionTracker), so entry is
+            # a single event rather than a per-frame repeated notification.
             self._last_alertness_severity = str(attention.level)
 
             if alert_result is not None and alert_result.active_severity != "NORMAL":

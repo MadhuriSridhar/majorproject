@@ -128,6 +128,15 @@ class DistractionTemporalTests(unittest.TestCase):
         self.assertGreaterEqual(obs.distraction_risk, 28.0)
         self.assertIn(obs.primary, ("head_turn_left", "passenger_side"))
 
+    def test_sustained_head_turn_activates_promptly(self) -> None:
+        t = 0.0
+        self.tracker.set_away("left", 0.0)
+        self.mon.update(None, 640, 480, t)
+        self.tracker.set_away("left", 0.5)
+        obs = self.mon.update(None, 640, 480, 0.5)
+        self.assertTrue(obs.head.active)
+        self.assertLessEqual(obs.head.duration_s, 0.5)
+
     def test_looking_down_off_road_persists(self) -> None:
         for t in (0.0, 0.5, 1.0, 2.0, 3.0, 4.0):
             self.tracker.set_away("down", t)

@@ -48,6 +48,13 @@ DEMO_LON = 77.5946
 LOCATION_UPDATE_INTERVAL_S = 30.0
 LOCATION_CACHE_MAX_AGE_S = 30 * 60
 
+# Baseline risk used when a real location is resolved but no configured
+# geofence matches. This is explicitly NOT a claim that the road is verified
+# safe — it only means no high-risk zone has been configured at these
+# coordinates.
+BASELINE_LOCATION_RISK = 5.0
+NO_ZONE_NAME = "No configured high-risk zone"
+
 IP_GEO_URLS = (
     "http://ip-api.com/json/?fields=status,message,lat,lon,city,regionName,country,query",
     "https://ipapi.co/json/",
@@ -135,6 +142,87 @@ def classify_geofence(
     return None
 
 
+@dataclass(frozen=True)
+class ZoneTransition:
+    """One geographic-context episode boundary (enter / exit / change)."""
+
+    event: str  # enter | exit | change
+    zone_type: str
+    zone_name: str
+    from_zone_name: str = ""
+    to_zone_name: str = ""
+    timestamp_s: float = 0.0
+
+
+class ZoneTransitionTracker:
+    """Track transitions between "no configured zone" and configured zones.
+
+    Staying inside the same zone is treated as one geographic-context episode,
+    so no repeated entry events are emitted. Entering, leaving, or switching
+    between two different zones each produce exactly one transition event.
+    """
+
+    NO_ZONE = "none"
+    KNOWN_ZONE_TYPES = ("school", "highway", "construction", "sharp_turn", "other")
+
+    def __init__(self) -> None:
+        self._zone_type = self.NO_ZONE
+        self._zone_name = ""
+
+    def reset(self) -> None:
+        """Reset to the 'no configured zone' baseline (new driving session)."""
+        self._zone_type = self.NO_ZONE
+        self._zone_name = ""
+
+    @classmethod
+    def classify(cls, zone_type: str | None) -> str:
+        value = str(zone_type or "none").strip().lower()
+        return value if value in cls.KNOWN_ZONE_TYPES else cls.NO_ZONE
+
+    def update(self, zone_type, zone_name, now_s: float = 0.0) -> ZoneTransition | None:
+        """Observe the current zone; return one ZoneTransition on a boundary."""
+        zt = self.classify(zone_type)
+        name = str(zone_name or "")
+        if zt == self._zone_type:
+            self._zone_name = name
+            return None
+        prev_type = self._zone_type
+        prev_name = self._zone_name
+        self._zone_type = zt
+        self._zone_name = name
+        if prev_type == self.NO_ZONE and zt != self.NO_ZONE:
+            return ZoneTransition("enter", zt, name, timestamp_s=now_s)
+        if prev_type != self.NO_ZONE and zt == self.NO_ZONE:
+            return ZoneTransition("exit", prev_type, prev_name, timestamp_s=now_s)
+        return ZoneTransition(
+            "change",
+            zt,
+            name,
+            from_zone_name=prev_name,
+            to_zone_name=name,
+            timestamp_s=now_s,
+        )
+
+
+def _zone_display_name(zone_type: str, zone_name: str) -> str:
+    return zone_name or str(zone_type).replace("_", " ").title()
+
+
+def format_zone_event_summary(transition: ZoneTransition | None) -> str:
+    """Compact one-line event text ('' when no transition happened)."""
+    if transition is None:
+        return ""
+    if transition.event == "enter":
+        return f"Entered {_zone_display_name(transition.zone_type, transition.zone_name or transition.zone_type)}"
+    if transition.event == "exit":
+        return f"Exited {_zone_display_name(transition.zone_type, transition.zone_name or transition.zone_type)}"
+    from_label = transition.from_zone_name or "other zone"
+    return (
+        f"Changed zone: {from_label} → "
+        f"{_zone_display_name(transition.zone_type, transition.to_zone_name or transition.zone_name)}"
+    )
+
+
 def _http_json(url: str, timeout_s: float = 4.0) -> dict | None:
     try:
         req = urllib.request.Request(
@@ -149,20 +237,35 @@ def _http_json(url: str, timeout_s: float = 4.0) -> dict | None:
 
 
 def format_location_summary(ctx: LocationContext) -> str:
-    """Compact multi-line text for the existing CONTEXT panel."""
+    """Compact multi-line text for the existing CONTEXT panel.
+
+    Honest about zones: when no configured geofence matches a real location,
+    it reports "No configured high-risk zone" with a baseline risk instead of
+    implying the road is verified safe.
+    """
     if ctx.mode == "disabled" or ctx.source == "Disabled":
         return "LOCATION:\nDisabled"
     if not ctx.available:
         return "LOCATION:\nUnavailable"
-    zone = ctx.zone_name or "Normal Road"
-    src = ctx.source
-    if ctx.mode == "demo" or src == "DEMO":
-        src = "DEMO"
+    is_demo = ctx.mode == "demo" or ctx.source == "DEMO"
+    src = "DEMO" if is_demo else ctx.source
+    in_zone = ctx.zone_type not in ("none", "", "unknown")
     risk = int(round(ctx.risk_level))
+    if in_zone:
+        zone = ctx.zone_name or ctx.zone_type.replace("_", " ").title()
+        marker = "HIGH RISK" if risk >= 40 else "ZONE"
+        risk_line = f"Risk {risk} ({marker})"
+    elif is_demo:
+        zone = ctx.zone_name or "Normal Road"
+        risk_line = f"Risk {risk}"
+    else:
+        zone = NO_ZONE_NAME
+        risk_line = "Location risk: Baseline"
     place = ctx.place_name or ""
+    lines = [f"LOCATION ({src}):", zone, risk_line]
     if place:
-        return f"LOCATION ({src}):\n{zone}\nRisk {risk}\n{place}"
-    return f"LOCATION ({src}):\n{zone}\nRisk {risk}"
+        lines.append(place)
+    return "\n".join(lines)
 
 
 class LocationRiskProvider:
@@ -196,7 +299,7 @@ class LocationRiskProvider:
         if hit:
             zone_type, zone_name, risk = hit
         else:
-            zone_type, zone_name, risk = "none", "Normal Road", 5.0
+            zone_type, zone_name, risk = "none", NO_ZONE_NAME, BASELINE_LOCATION_RISK
         return LocationContext(
             latitude=float(lat),
             longitude=float(lon),
@@ -251,8 +354,8 @@ class LocationRiskProvider:
                 latitude=lat,
                 longitude=lon,
                 zone_type=str(data.get("zone_type", "none")) if cache_fresh else "none",
-                zone_name=str(data.get("zone_name", "Normal Road")) if cache_fresh else "Normal Road",
-                risk_level=float(data.get("risk_level", 0.0)) if cache_fresh else 0.0,
+                zone_name=str(data.get("zone_name", NO_ZONE_NAME)) if cache_fresh else NO_ZONE_NAME,
+                risk_level=float(data.get("risk_level", 0.0)) if cache_fresh else BASELINE_LOCATION_RISK,
                 source="cache",
                 place_name=str(data.get("place_name", "")),
                 available=True,
@@ -400,7 +503,7 @@ class LocationRiskProvider:
                 latitude=self._last_ctx.latitude,
                 longitude=self._last_ctx.longitude,
                 zone_type=self._last_ctx.zone_type,
-                zone_name=self._last_ctx.zone_name or "Normal Road",
+                zone_name=self._last_ctx.zone_name or NO_ZONE_NAME,
                 risk_level=self._last_ctx.risk_level,
                 source="cache",
                 place_name=self._last_ctx.place_name,

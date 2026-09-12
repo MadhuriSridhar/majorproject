@@ -125,18 +125,26 @@ DEFAULT_SOUNDS: dict[str, str] = {
 # Severity priority (higher wins).
 _SEVERITY_PRIORITY = {"NORMAL": 0, "LOW_FATIGUE": 1, "ALERT": 2, "WARNING": 3, "DROWSY": 4}
 
+# Central, single voice volume for ALL spoken warnings. This is intentionally
+# separate from the alarm (WAV) volumes so that every voice message has the
+# same perceived loudness regardless of severity/category.
+VOICE_VOLUME = 0.85
+
 
 @dataclass(frozen=True)
 class AudioSettings:
     """Snapshot of current audio settings used by the engine.
 
-    ``alert_volume`` and ``alarm_volume`` are intentionally independent:
-    - ``alert_volume`` controls LOW_FATIGUE / ALERT sound and voice.
-    - ``alarm_volume`` controls WARNING / DROWSY alarm sound and voice.
+    ``alert_volume`` / ``alarm_volume`` control the alarm *sounds* (WAV beeps):
+    - ``alert_volume``  -> LOW_FATIGUE / ALERT alarm sound.
+    - ``alarm_volume``  -> WARNING / DROWSY alarm sound.
+    ``voice_volume`` is a single, shared volume for every spoken TTS warning so
+    no message is unexpectedly quieter or louder than another.
     """
 
-    alert_volume: float = 0.6  # 0.0 .. 1.0 -> LOW_FATIGUE / ALERT sound + voice
-    alarm_volume: float = 0.7  # 0.0 .. 1.0 -> WARNING / DROWSY alarm + voice
+    alert_volume: float = 0.6  # 0.0 .. 1.0 -> LOW_FATIGUE / ALERT alarm sound
+    alarm_volume: float = 0.7  # 0.0 .. 1.0 -> WARNING / DROWSY alarm sound
+    voice_volume: float = VOICE_VOLUME  # 0.0 .. 1.0 -> every spoken warning
     voice_enabled: bool = True
     sound_enabled: bool = True
     alert_sound: str = "soft_beep_2"
@@ -220,6 +228,7 @@ class AudioBackend(threading.Thread):
         on_done: callable | None = None,
         reason: str | None = None,
         contributing_factors: tuple[str, ...] | list[str] | None = None,
+        generation: int = 0,
     ) -> None:
         super().__init__(name=f"audio-{severity}", daemon=True)
         self.severity = severity
@@ -229,6 +238,7 @@ class AudioBackend(threading.Thread):
         self.on_done = on_done
         self.reason = reason or ""
         self.contributing_factors = tuple(contributing_factors or ())
+        self.generation = int(generation)
         self.interrupted = threading.Event()
         self._sound_interrupted = False
         self._voice_interrupted = False
@@ -367,7 +377,7 @@ class AudioBackend(threading.Thread):
             print(f"AUDIO: {self.severity}")
             print(f"Voice: ENABLED")
             engine = pyttsx3.init()
-            volume = self._volume_for(self.severity)
+            volume = max(0.0, min(1.0, float(self.settings.voice_volume)))
             try:
                 engine.setProperty("volume", volume)
             except Exception:
@@ -473,6 +483,7 @@ class AudioEngine:
         self._current: AudioBackend | None = None
         self._active_severity: str | None = None
         self._last_error: str | None = None
+        self._generation = 0
         # Generate sounds on startup (best effort).
         try:
             ensure_sounds_generated()
@@ -499,10 +510,14 @@ class AudioEngine:
             return self.settings.drowsy_sound
         return ""
 
-    def _on_job_done(self, severity: str) -> None:
+    def _on_job_done(self, severity: str, generation: int | None = None) -> None:
         """A playback job finished naturally - release its priority slot."""
         with self._lock:
-            if self._active_severity == severity:
+            current = self._current
+            if (
+                self._active_severity == severity
+                and (generation is None or current is None or current.generation == generation)
+            ):
                 self._active_severity = None
 
     def play_alert(
@@ -540,11 +555,20 @@ class AudioEngine:
                 return
 
             if current is not None and current.is_alive():
-                # Stop the current alarm so the new
-                # higher-priority alert takes over immediately, and prevent its
-                # voice from being spoken.
                 current.interrupted.set()
 
+        # Do not let the replacement thread overlap the interrupted sequence.
+        # Joining outside the lock avoids deadlocking its completion callback.
+        if current is not None and current.is_alive():
+            current.join(timeout=2.0)
+            if current.is_alive():
+                # A stuck backend is safer to suppress than to overlap with a
+                # second alarm/voice sequence.
+                return
+
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
             self._active_severity = severity
             wav = sound_path(self._sound_for(severity))
             job = AudioBackend(
@@ -552,9 +576,10 @@ class AudioEngine:
                 wav_path=wav,
                 settings=self.settings,
                 on_error=self._record_error,
-                on_done=self._on_job_done,
+                on_done=lambda completed, token=generation: self._on_job_done(completed, token),
                 reason=reason,
                 contributing_factors=contributing_factors,
+                generation=generation,
             )
             self._current = job
             job.start()
@@ -571,6 +596,7 @@ class AudioEngine:
             self._active_severity = None
         if current is not None:
             current.interrupted.set()
+            current.join(timeout=2.0)
 
     def shutdown(self) -> None:
         self.interrupt_all()

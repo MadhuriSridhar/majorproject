@@ -62,6 +62,7 @@ def build_summary_text(stats: SessionStats) -> str:
         f"Fatigue Events:        {stats.fatigue_event_count}",
         f"Recovery Events:       {stats.recovery_event_count}",
         f"High-Risk Zone Events: {stats.high_risk_zone_event_count}",
+        f"High-Risk Zone Exits:  {stats.zone_exit_event_count}",
         "",
         f"Night Context:         {night}",
         "",
@@ -184,6 +185,7 @@ def export_pdf(stats: SessionStats, output_dir: Path | None = None) -> Path:
         ["Fatigue Events", str(stats.fatigue_event_count)],
         ["Recovery Events", str(stats.recovery_event_count)],
         ["High-Risk Zone Events", str(stats.high_risk_zone_event_count)],
+        ["High-Risk Zone Exits", str(stats.zone_exit_event_count)],
         ["Night Context", night],
     ]
     info_table = Table(info_rows, colWidths=[55 * mm, 100 * mm])

@@ -160,12 +160,15 @@ class VolumeSelectionTests(unittest.TestCase):
         )
         self.assertEqual(backend2._volume_for("LOW_FATIGUE"), 0.0)  # -1 clamped to 0
 
-    def test_voice_volume_respects_alert_volume(self) -> None:
-        # LOW_FATIGUE voice uses alert_volume (not alarm_volume).
+    def test_voice_uses_single_shared_voice_volume(self) -> None:
+        # Voice volume is one shared value used for every spoken warning, not
+        # derived from alert_volume/alarm_volume (PART 7 fix).
         backend = AudioBackend(
             severity="LOW_FATIGUE",
             wav_path=None,
-            settings=AudioSettings(alert_volume=0.45, alarm_volume=0.90, voice_enabled=True),
+            settings=AudioSettings(
+                alert_volume=0.40, alarm_volume=0.90, voice_volume=0.45, voice_enabled=True
+            ),
         )
         applied: list[float] = []
 
@@ -201,6 +204,7 @@ class VolumeSelectionTests(unittest.TestCase):
                 _sys.modules.pop("pyttsx3", None)
 
         self.assertTrue(applied, "volume property should have been set")
+        # Voice uses voice_volume (0.45), NOT alert_volume (0.40).
         self.assertAlmostEqual(applied[0], 0.45)
 
     def test_subsequent_alert_uses_updated_volume(self) -> None:
@@ -372,6 +376,27 @@ class AudioEnginePriorityTests(unittest.TestCase):
         engine._on_job_done("DROWSY")
         self.assertIsNone(engine.active_severity)
         engine.play_alert("DROWSY")
+        self.assertEqual(engine.active_severity, "DROWSY")
+        engine.shutdown()
+
+    def test_replacement_waits_for_interrupted_job(self) -> None:
+        engine = self._engine()
+        class FakeJob:
+            def __init__(self) -> None:
+                self.interrupted = type("Event", (), {"set": lambda self: None})()
+                self.finished = False
+
+            def is_alive(self) -> bool:
+                return not self.finished
+
+            def join(self, timeout=None) -> None:
+                self.finished = True
+
+        fake = FakeJob()
+        engine._current = fake  # type: ignore[assignment]
+        engine._active_severity = "WARNING"
+        engine.play_alert("DROWSY")
+        self.assertTrue(fake.finished)
         self.assertEqual(engine.active_severity, "DROWSY")
         engine.shutdown()
 
