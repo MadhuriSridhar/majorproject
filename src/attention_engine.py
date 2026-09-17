@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 from distraction_monitor import DistractionObservation
 
@@ -43,6 +44,10 @@ CONTEXT_WEATHER_HIGH_RISK = 40.0
 # Maximum urgency reduction contributed by each axis (risk=100 yields the gain).
 LOCATION_URGENCY_GAIN = 0.25
 WEATHER_URGENCY_GAIN = 0.20
+SPEED_CONTEXT_GAIN = 0.12
+TIME_CONTEXT_GAIN = 0.10
+CONTEXT_SPEED_HIGH_RISK = 40.0
+CONTEXT_TIME_HIGH_RISK = 1.0
 
 # Fixed urgency contribution for a verified high-risk zone type. Only applied
 # for genuinely risky zones; "none" (normal road) contributes nothing.
@@ -113,6 +118,10 @@ class AttentionDecision:
     recommendation: str = ""
     head_direction: str = "unknown"
     context_urgency: float = 1.0
+    carla_speed_kmh: float = 0.0
+    carla_speed_risk: float = 0.0
+    carla_vehicle_state: str = "UNAVAILABLE"
+    carla_time_period: str = "UNKNOWN"
 
 
 def risk_level_from_score(score: float | None) -> str:
@@ -161,6 +170,8 @@ def apply_context_boost(
     location_risk: float = 0.0,
     weather_risk: float = 0.0,
     zone_type: str = "none",
+    speed_risk: float = 0.0,
+    time_risk: float = 0.0,
 ) -> float:
     """
     Amplify driver risk with location / weather context.
@@ -175,6 +186,8 @@ def apply_context_boost(
     d = max(0.0, min(100.0, float(distraction_risk)))
     loc = max(0.0, min(100.0, float(location_risk)))
     wx = max(0.0, min(100.0, float(weather_risk)))
+    speed = max(0.0, min(100.0, float(speed_risk)))
+    time = max(0.0, min(100.0, float(time_risk)))
     boost = 0.0
 
     # Soft proportional context when there is already meaningful driver risk.
@@ -184,6 +197,7 @@ def apply_context_boost(
             LOCATION_CONTEXT_GAIN * loc + WEATHER_CONTEXT_GAIN * wx,
         )
         boost += soft * (0.35 + base / 200.0)
+        boost += (SPEED_CONTEXT_GAIN * speed) + (TIME_CONTEXT_GAIN * time)
 
     # Moderate distraction + elevated road zone (school / construction / sharp turn).
     if d >= 35.0 and loc >= 55.0:
@@ -206,6 +220,8 @@ def context_urgency_from(
     location_risk: float,
     weather_risk: float,
     zone_type: str = "none",
+    speed_risk: float = 0.0,
+    time_risk: float = 0.0,
 ) -> float:
     """Deterministic context urgency modifier (1.0 = normal, lower = more urgent).
 
@@ -221,6 +237,8 @@ def context_urgency_from(
     """
     loc = max(0.0, min(100.0, float(location_risk or 0.0)))
     wx = max(0.0, min(100.0, float(weather_risk or 0.0)))
+    speed = max(0.0, min(100.0, float(speed_risk or 0.0)))
+    time = max(0.0, min(100.0, float(time_risk or 0.0)))
     zone = (zone_type or "none").strip().lower()
 
     reduction = 0.0
@@ -232,6 +250,10 @@ def context_urgency_from(
         reduction += WEATHER_URGENCY_GAIN * (
             (wx - CONTEXT_WEATHER_HIGH_RISK) / (100.0 - CONTEXT_WEATHER_HIGH_RISK)
         )
+    if speed >= CONTEXT_SPEED_HIGH_RISK:
+        reduction += 0.10 * ((speed - CONTEXT_SPEED_HIGH_RISK) / (100.0 - CONTEXT_SPEED_HIGH_RISK))
+    if time >= CONTEXT_TIME_HIGH_RISK:
+        reduction += 0.08
     if zone in ZONE_URGENCY:
         reduction += ZONE_URGENCY[zone]
 
@@ -394,6 +416,7 @@ class AttentionEngine:
         weather_risk: float = 0.0,
         location_zone: str = "none",
         weather_condition: str = "unknown",
+        carla_context: Mapping[str, Any] | None = None,
     ) -> AttentionDecision:
         if not face_ok:
             self.reset()
@@ -421,9 +444,23 @@ class AttentionEngine:
         d = float(distraction.distraction_risk) if distraction is not None else 0.0
         loc = max(0.0, min(100.0, float(location_risk or 0.0)))
         wx = max(0.0, min(100.0, float(weather_risk or 0.0)))
+        carla = carla_context or {}
+        carla_weather = carla.get("weather") or {}
+        carla_time = carla.get("time") or {}
+        carla_speed_kmh = max(0.0, float(carla.get("speed_kmh") or 0.0))
+        carla_speed_risk = max(0.0, min(100.0, float(carla.get("speed_risk") or 0.0)))
+        carla_time_risk = max(0.0, min(100.0, float(carla_time.get("risk") or 0.0)))
+        if carla.get("carla_connected"):
+            wx = max(wx, float(carla_weather.get("risk") or 0.0))
+            if weather_condition in ("", "unknown"):
+                weather_condition = str(carla_weather.get("condition") or "unknown")
+        vehicle_state = str(carla.get("vehicle_state") or "UNAVAILABLE")
+        time_period = str(carla_time.get("period") or "UNKNOWN")
         zone = str(location_zone or "none")
         wx_cond = str(weather_condition or "unknown")
-        context_urgency = context_urgency_from(loc, wx, zone)
+        context_urgency = context_urgency_from(
+            loc, wx, zone, carla_speed_risk, carla_time_risk
+        )
         head_dir = "unknown"
         if distraction is not None and distraction.head is not None:
             head_dir = str(distraction.head.direction or "unknown")
@@ -454,7 +491,9 @@ class AttentionEngine:
                 raw = min(100.0, raw + 8.0)
 
         # Location / weather amplify the fused driver risk (do not rewrite detectors).
-        raw = apply_context_boost(raw, d, loc, wx, zone)
+        raw = apply_context_boost(
+            raw, d, loc, wx, zone, carla_speed_risk, carla_time_risk
+        )
         raw = min(100.0, max(0.0, float(raw)))
 
         smoothed = self._update_smoothed(raw, now_s)
@@ -525,4 +564,8 @@ class AttentionEngine:
             recommendation=recommendation,
             head_direction=head_dir,
             context_urgency=context_urgency,
+            carla_speed_kmh=carla_speed_kmh,
+            carla_speed_risk=carla_speed_risk,
+            carla_vehicle_state=vehicle_state,
+            carla_time_period=time_period,
         )

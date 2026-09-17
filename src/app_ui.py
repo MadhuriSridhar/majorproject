@@ -15,6 +15,7 @@ The UI reads the latest state from the worker - it never computes fatigue.
 from __future__ import annotations
 
 import queue
+import os
 import threading
 import time
 import tkinter as tk
@@ -150,6 +151,22 @@ def should_run_analysis(active: bool, camera_ok: bool, num_faces: int) -> bool:
 FACE_LOSS_GRACE_S = 1.5
 
 
+def create_optional_carla_context():
+    """Create CARLA context only when explicitly enabled and available."""
+    if os.environ.get("CARLA_ENABLED", "0").strip().lower() not in {"1", "true", "yes"}:
+        return None
+    try:
+        from carla_context import CarlaContext
+
+        return CarlaContext(
+            host=os.environ.get("CARLA_HOST", "localhost"),
+            port=int(os.environ.get("CARLA_PORT", "2000")),
+        )
+    except Exception as exc:
+        print(f"CARLA context unavailable: {exc}")
+        return None
+
+
 def head_is_down(head) -> bool:
     """True only when head pose is actively classified as looking down.
 
@@ -206,6 +223,7 @@ class CameraWorker(threading.Thread):
         on_status_change=None,
         settings_store: SettingsStore | None = None,
         face_loss_grace_s: float = FACE_LOSS_GRACE_S,
+        carla_context=None,
     ) -> None:
         super().__init__(name="camera-worker", daemon=True)
         self.session_manager = session_manager
@@ -213,6 +231,7 @@ class CameraWorker(threading.Thread):
         self.audio_engine = audio_engine
         self.on_status_change = on_status_change
         self.settings_store = settings_store
+        self.carla_context = carla_context
 
         self.frame_queue: queue.Queue = queue.Queue(maxsize=2)
         self.state: dict = {}
@@ -228,6 +247,7 @@ class CameraWorker(threading.Thread):
         self._context_lock = threading.Lock()
         self._location_ctx = None
         self._weather_ctx = None
+        self._carla_ctx: dict = {}
         self._context_stop = threading.Event()
         self._context_thread: threading.Thread | None = None
 
@@ -279,6 +299,7 @@ class CameraWorker(threading.Thread):
         with self._context_lock:
             self._location_ctx = None
             self._weather_ctx = None
+            self._carla_ctx = {}
 
     def _evidence_ready(self, now_s: float, face_valid: bool) -> bool:
         """Require a short contiguous run of valid face evidence at startup."""
@@ -407,9 +428,16 @@ class CameraWorker(threading.Thread):
                         location_ctx.latitude, location_ctx.longitude
                     )
                 weather_ctx = self.weather_provider.update(now)
+                carla_ctx = {}
+                if self.carla_context is not None:
+                    try:
+                        carla_ctx = self.carla_context.get_context()
+                    except Exception as exc:
+                        print(f"CARLA context update error: {exc}")
                 with self._context_lock:
                     self._location_ctx = location_ctx
                     self._weather_ctx = weather_ctx
+                    self._carla_ctx = carla_ctx
             except Exception as exc:
                 print(f"Context worker error: {exc}")
             self._context_stop.wait(1.0)
@@ -580,6 +608,7 @@ class CameraWorker(threading.Thread):
                 with self._context_lock:
                     location_ctx = self._location_ctx
                     weather_ctx = self._weather_ctx
+                    carla_ctx = dict(self._carla_ctx)
                 if location_ctx is None:
                     location_ctx = self.location_provider._unavailable("Unavailable")
                 if weather_ctx is None:
@@ -636,6 +665,7 @@ class CameraWorker(threading.Thread):
                         weather_risk=wx_risk,
                         location_zone=str(location_ctx.zone_type or "none"),
                         weather_condition=str(weather_ctx.weather_condition or "unknown"),
+                        carla_context=carla_ctx,
                     )
                     # Alerts follow combined attention severity, but the live
                     # reason and score remain available to the single escalation
@@ -735,6 +765,7 @@ class CameraWorker(threading.Thread):
                             "distraction": distraction_obs,
                             "location": location_ctx,
                             "weather": weather_ctx,
+                            "carla": carla_ctx,
                             "zone_event": self._last_zone_event_text,
                             "alert_result": alert_result,
                             "diagnostics": diagnostics,
@@ -1182,6 +1213,7 @@ class DrowsinessApp(tk.Tk):
         self.prefs = DashboardPreferences()
         self.session_manager = SessionManager(use_demo_duration=USE_DEMO_DRIVING_DURATION)
         self.alert_controller = AlertEscalationController()
+        self.carla_context = create_optional_carla_context()
         self.audio_engine = AudioEngine(AudioSettings(
             alert_volume=float(self.settings_store.get("alert_volume", 0.6)),
             alarm_volume=float(self.settings_store.get("alarm_volume", 0.7)),
@@ -1198,6 +1230,7 @@ class DrowsinessApp(tk.Tk):
             alert_controller=self.alert_controller,
             audio_engine=self.audio_engine,
             settings_store=self.settings_store,
+            carla_context=self.carla_context,
         )
 
         self.current_screen = "start"
@@ -1725,6 +1758,7 @@ class DrowsinessApp(tk.Tk):
             alert_controller=self.alert_controller,
             audio_engine=self.audio_engine,
             settings_store=self.settings_store,
+            carla_context=self.carla_context,
         )
         self.camera_worker.start_camera()
 

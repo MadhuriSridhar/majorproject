@@ -47,6 +47,46 @@ def _dist(risk: float) -> DistractionObservation:
 
 
 class ContextAwareRiskTests(unittest.TestCase):
+    def test_carla_speed_alone_does_not_create_attention_risk(self) -> None:
+        out = AttentionEngine().update(
+            fatigue_risk=0.0,
+            distraction=None,
+            now_s=0.0,
+            carla_context={
+                "carla_connected": True,
+                "speed_kmh": 100.0,
+                "speed_risk": 75.0,
+                "vehicle_state": "MOVING",
+            },
+        )
+        self.assertEqual(out.level, "SAFE")
+        self.assertEqual(out.alert_severity, "NORMAL")
+
+    def test_carla_speed_increases_existing_distraction_context(self) -> None:
+        normal = AttentionEngine().update(
+            fatigue_risk=10.0,
+            distraction=_dist(45.0),
+            now_s=0.0,
+        )
+        fast = AttentionEngine().update(
+            fatigue_risk=10.0,
+            distraction=_dist(45.0),
+            now_s=0.0,
+            carla_context={
+                "carla_connected": True,
+                "speed_kmh": 100.0,
+                "speed_risk": 75.0,
+                "vehicle_state": "MOVING",
+            },
+        )
+        self.assertGreater(fast.combined_risk, normal.combined_risk)
+        self.assertLess(fast.context_urgency, normal.context_urgency)
+
+    def test_carla_context_defaults_are_backward_compatible(self) -> None:
+        out = AttentionEngine().update(fatigue_risk=0.0, distraction=None, now_s=0.0)
+        self.assertEqual(out.carla_speed_risk, 0.0)
+        self.assertEqual(out.carla_vehicle_state, "UNAVAILABLE")
+
     def test_school_zone_raises_above_normal_location(self) -> None:
         d = 45.0
         base = fuse_raw_risk(10.0, d)
