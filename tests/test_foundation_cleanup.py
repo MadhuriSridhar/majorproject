@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from alert_escalation import AlertEscalationController  # noqa: E402
-from app_ui import resolve_driver_state, should_run_analysis  # noqa: E402
+from app_ui import format_carla_context, resolve_driver_state, should_run_analysis  # noqa: E402
 from audio_engine import AudioBackend, AudioSettings  # noqa: E402
 from fatigue_engine import (  # noqa: E402
     RECENT_YAWN_MAX,
@@ -35,6 +35,48 @@ from temporal_mouth import YawnTracker  # noqa: E402
 
 def E(**kwargs) -> FatigueEvidence:
     return FatigueEvidence(**kwargs)
+
+
+class CarlaContextDisplayTests(unittest.TestCase):
+    def test_unavailable_display(self) -> None:
+        self.assertEqual(
+            format_carla_context(None),
+            {
+                "vehicle": "UNAVAILABLE",
+                "speed": "--",
+                "weather": "--",
+                "time": "--",
+                "session": "--",
+            },
+        )
+
+    def test_connected_display_uses_snapshot_fields(self) -> None:
+        display = format_carla_context(
+            {
+                "carla_connected": True,
+                "vehicle_state": "MOVING",
+                "speed_kmh": 7.04,
+                "driving_session_id": 3,
+                "weather": {"condition": "CLEAR"},
+                "time": {"period": "DAY"},
+            }
+        )
+        self.assertEqual(display["vehicle"], "MOVING")
+        self.assertEqual(display["speed"], "7.0 km/h")
+        self.assertEqual(display["weather"], "CLEAR")
+        self.assertEqual(display["time"], "DAY")
+        self.assertEqual(display["session"], "3")
+
+    def test_no_vehicle_display(self) -> None:
+        display = format_carla_context(
+            {
+                "carla_connected": True,
+                "vehicle_state": "NO_VEHICLE",
+                "speed_kmh": 0.0,
+            }
+        )
+        self.assertEqual(display["vehicle"], "NO_VEHICLE")
+        self.assertEqual(display["speed"], "0.0 km/h")
 
 
 class YawnContributionCapTests(unittest.TestCase):

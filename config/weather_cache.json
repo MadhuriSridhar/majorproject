@@ -1,14 +1,14 @@
 {
-  "weather_condition": "clouds",
-  "temperature": 28.2,
-  "visibility": 36960.0,
-  "precipitation": 0.0,
-  "wind": 2.2,
-  "weather_risk": 10.0,
+  "weather_condition": "drizzle",
+  "temperature": 21.1,
+  "visibility": 3360.0,
+  "precipitation": 0.2,
+  "wind": 1.6,
+  "weather_risk": 35.0,
   "latitude": 12.9753,
   "longitude": 77.591,
-  "last_update_text": "upd 19:51",
-  "rain_expected_soon": false,
-  "rain_expected_text": "",
-  "updated_at": 1789222915.2574737
+  "last_update_text": "upd 20:48",
+  "rain_expected_soon": true,
+  "rain_expected_text": "Rain expected soon (~01:00, 54%)",
+  "updated_at": 1789744722.1354578
 }

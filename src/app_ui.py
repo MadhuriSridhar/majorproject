@@ -144,6 +144,32 @@ def should_run_analysis(active: bool, camera_ok: bool, num_faces: int) -> bool:
     return active and camera_ok and num_faces == 1
 
 
+def format_carla_context(context: dict | None) -> dict[str, str]:
+    """Format the existing CARLA snapshot for compact dashboard display."""
+    snapshot = context or {}
+    if not snapshot.get("carla_connected"):
+        return {
+            "vehicle": "UNAVAILABLE",
+            "speed": "--",
+            "weather": "--",
+            "time": "--",
+            "session": "--",
+        }
+
+    weather = snapshot.get("weather") or {}
+    time_context = snapshot.get("time") or {}
+    vehicle = str(snapshot.get("vehicle_state") or "NO_VEHICLE").upper()
+    speed = float(snapshot.get("speed_kmh") or 0.0)
+    session_id = snapshot.get("driving_session_id")
+    return {
+        "vehicle": vehicle,
+        "speed": f"{speed:.1f} km/h",
+        "weather": str(weather.get("condition") or "UNKNOWN").upper(),
+        "time": str(time_context.get("period") or "UNKNOWN").upper(),
+        "session": str(session_id) if session_id else "--",
+    }
+
+
 # A short deterministic grace period for transient landmark dropouts (e.g. a
 # head turn that briefly hides the face). Within this window the system keeps
 # its last valid state and shows "temporarily unavailable" instead of treating
@@ -1400,6 +1426,39 @@ class DrowsinessApp(tk.Tk):
             self.cam_overlay = tk.Label(cam_panel, text="", font=FONT_SMALL, bg=BG_PANEL, fg=FG)
             self.cam_overlay.pack(anchor="w", padx=10, pady=(0, 6))
 
+        # Compact CARLA context card between the camera and right-side panels.
+        self.ctx_carla_vehicle = self.ctx_carla_speed = None
+        self.ctx_carla_weather = self.ctx_carla_time = self.ctx_carla_session = None
+        carla_panel = tk.Frame(
+            top,
+            bg=BG_CARD,
+            bd=1,
+            highlightthickness=1,
+            highlightbackground="#2a3040",
+            width=210,
+            height=320,
+        )
+        carla_panel.pack(side="left", fill="y", padx=(0, 6))
+        carla_panel.pack_propagate(False)
+        tk.Label(
+            carla_panel,
+            text="CARLA DRIVING CONTEXT",
+            font=FONT_SMALL,
+            bg=BG_CARD,
+            fg=FG_MUTED,
+            wraplength=185,
+        ).pack(anchor="w", padx=10, pady=(8, 10))
+        self.ctx_carla_vehicle = tk.Label(carla_panel, text="Vehicle: UNAVAILABLE", font=FONT_SMALL, bg=BG_CARD, fg=FG, anchor="w")
+        self.ctx_carla_vehicle.pack(fill="x", padx=10, pady=3)
+        self.ctx_carla_speed = tk.Label(carla_panel, text="Speed: --", font=FONT_SMALL, bg=BG_CARD, fg=FG, anchor="w")
+        self.ctx_carla_speed.pack(fill="x", padx=10, pady=3)
+        self.ctx_carla_weather = tk.Label(carla_panel, text="Weather: --", font=FONT_SMALL, bg=BG_CARD, fg=FG, anchor="w")
+        self.ctx_carla_weather.pack(fill="x", padx=10, pady=3)
+        self.ctx_carla_time = tk.Label(carla_panel, text="Time: --", font=FONT_SMALL, bg=BG_CARD, fg=FG, anchor="w")
+        self.ctx_carla_time.pack(fill="x", padx=10, pady=3)
+        self.ctx_carla_session = tk.Label(carla_panel, text="Driving Session: --", font=FONT_SMALL, bg=BG_CARD, fg=FG, anchor="w", wraplength=185, justify="left")
+        self.ctx_carla_session.pack(fill="x", padx=10, pady=3)
+
         # Right column.
         right = tk.Frame(top, bg=BG)
         right.pack(side="right", fill="y", padx=(6, 0), expand=False)
@@ -1467,6 +1526,50 @@ class DrowsinessApp(tk.Tk):
             for c in range(3):
                 self.driver_grid.columnconfigure(c, weight=1)
 
+        # General context strip below the monitoring row.
+        self.ctx_time = self.ctx_night = self.ctx_duration = None
+        self.ctx_location = self.ctx_weather = None
+        self.ctx_zone_event = None
+        context_components = (
+            "current_time",
+            "night_context",
+            "driving_duration",
+            "location_context",
+            "weather_context",
+        )
+        if any(self.prefs.is_enabled(comp) for comp in context_components):
+            context_bar = tk.Frame(
+                main,
+                bg=BG_CARD,
+                bd=1,
+                highlightthickness=1,
+                highlightbackground="#2a3040",
+            )
+            context_bar.pack(fill="x", padx=12, pady=(0, 2))
+            tk.Label(
+                context_bar,
+                text="CONTEXT",
+                font=FONT_SMALL,
+                bg=BG_CARD,
+                fg=FG_MUTED,
+            ).pack(side="left", padx=(10, 14), pady=7)
+            if self.prefs.is_enabled("current_time"):
+                self.ctx_time = tk.Label(context_bar, text="Current Time: --:--:--", font=FONT_SMALL, bg=BG_CARD, fg=FG)
+                self.ctx_time.pack(side="left", padx=8, pady=7)
+            if self.prefs.is_enabled("night_context"):
+                self.ctx_night = tk.Label(context_bar, text="Night: INACTIVE", font=FONT_SMALL, bg=BG_CARD, fg=FG)
+                self.ctx_night.pack(side="left", padx=8, pady=7)
+            if self.prefs.is_enabled("driving_duration"):
+                self.ctx_duration = tk.Label(context_bar, text="Driving Duration: 00:00:00", font=FONT_SMALL, bg=BG_CARD, fg=FG)
+                self.ctx_duration.pack(side="left", padx=8, pady=7)
+            if self.prefs.is_enabled("location_context"):
+                self.ctx_location = tk.Label(context_bar, text="Location: Unavailable", font=FONT_SMALL, bg=BG_CARD, fg=FG)
+                self.ctx_location.pack(side="left", padx=8, pady=7)
+                self.ctx_zone_event = tk.Label(context_bar, text="", font=FONT_SMALL, bg=BG_CARD, fg=AMBER)
+            if self.prefs.is_enabled("weather_context"):
+                self.ctx_weather = tk.Label(context_bar, text="Weather: Unavailable", font=FONT_SMALL, bg=BG_CARD, fg=FG)
+                self.ctx_weather.pack(side="left", padx=8, pady=7)
+
         # Lower section: risk breakdown + context.
         lower = tk.Frame(main, bg=BG)
         lower.pack(fill="x", padx=12, pady=8)
@@ -1512,63 +1615,6 @@ class DrowsinessApp(tk.Tk):
         )
         self.rb_table_container.pack(fill="both", expand=True)
         self.rb_table_container.pack_forget()
-
-        # Context panel.
-        self.ctx_time = self.ctx_night = self.ctx_duration = None
-        self.ctx_location = self.ctx_weather = None
-        self.ctx_zone_event = None
-        context_components = (
-            "current_time",
-            "night_context",
-            "driving_duration",
-            "location_context",
-            "weather_context",
-        )
-        if any(self.prefs.is_enabled(comp) for comp in context_components):
-            ctx_panel = tk.Frame(lower, bg=BG_CARD, bd=1, highlightthickness=1, highlightbackground="#2a3040", width=320)
-            ctx_panel.pack(side="right", fill="y", padx=(6, 0))
-            tk.Label(ctx_panel, text="CONTEXT", font=FONT_SMALL, bg=BG_CARD, fg=FG_MUTED).pack(anchor="w", padx=10, pady=(6, 2))
-            if self.prefs.is_enabled("current_time"):
-                self.ctx_time = tk.Label(ctx_panel, text="CURRENT TIME:\n--:--:--", font=FONT_BODY, bg=BG_CARD, fg=FG, justify="left", wraplength=285)
-                self.ctx_time.pack(anchor="w", padx=10, pady=2)
-            if self.prefs.is_enabled("night_context"):
-                self.ctx_night = tk.Label(ctx_panel, text="NIGHT CONTEXT:\nINACTIVE", font=FONT_BODY, bg=BG_CARD, fg=FG, justify="left", wraplength=285)
-                self.ctx_night.pack(anchor="w", padx=10, pady=2)
-            if self.prefs.is_enabled("driving_duration"):
-                self.ctx_duration = tk.Label(ctx_panel, text="DRIVING DURATION:\n00:00:00", font=FONT_BODY, bg=BG_CARD, fg=FG, justify="left", wraplength=285)
-                self.ctx_duration.pack(anchor="w", padx=10, pady=2)
-            if self.prefs.is_enabled("location_context"):
-                self.ctx_location = tk.Label(
-                    ctx_panel,
-                    text="LOCATION:\nUnavailable",
-                    font=("Segoe UI", 9),
-                    bg=BG_CARD,
-                    fg=FG,
-                    justify="left",
-                    wraplength=285,
-                )
-                self.ctx_location.pack(anchor="w", padx=10, pady=2)
-                # Transient zone-entry/exit line (packed only when an event exists).
-                self.ctx_zone_event = tk.Label(
-                    ctx_panel,
-                    text="",
-                    font=("Segoe UI", 9, "bold"),
-                    bg=BG_CARD,
-                    fg=AMBER,
-                    justify="left",
-                    wraplength=285,
-                )
-            if self.prefs.is_enabled("weather_context"):
-                self.ctx_weather = tk.Label(
-                    ctx_panel,
-                    text="WEATHER:\nUnavailable",
-                    font=("Segoe UI", 9),
-                    bg=BG_CARD,
-                    fg=FG,
-                    justify="left",
-                    wraplength=285,
-                )
-                self.ctx_weather.pack(anchor="w", padx=10, pady=2)
 
         # Alert overlay (full-screen DROWSY etc.) - built on top.
         if not hasattr(self, "alert_overlay"):
@@ -2088,28 +2134,43 @@ class DrowsinessApp(tk.Tk):
 
         # Context panel.
         if self.ctx_time is not None:
-            self.ctx_time.configure(text=f"CURRENT TIME:\n{time_ctx.time_text}")
+            self.ctx_time.configure(text=f"Current Time: {time_ctx.time_text}")
         night = "ACTIVE" if time_ctx.night_context_active else "INACTIVE"
         if self.ctx_night is not None:
             self.ctx_night.configure(
-                text=f"NIGHT CONTEXT:\n{night}", fg=YELLOW if time_ctx.night_context_active else FG
+                text=f"Night: {night}", fg=YELLOW if time_ctx.night_context_active else FG
             )
         if self.ctx_duration is not None:
             self.ctx_duration.configure(
-                text=f"DRIVING DURATION:\n{self.session_manager.driving_time_text()}"
+                text=f"Driving Duration: {self.session_manager.driving_time_text()}"
             )
         location_ctx = data.get("location")
         if self.ctx_location is not None:
             if location_ctx is not None:
-                self.ctx_location.configure(text=format_location_summary(location_ctx))
+                self.ctx_location.configure(
+                    text=format_location_summary(location_ctx).replace("\n", " ")
+                )
             else:
-                self.ctx_location.configure(text="LOCATION:\nUnavailable")
+                self.ctx_location.configure(text="Location: Unavailable")
         weather_ctx = data.get("weather")
         if self.ctx_weather is not None:
             if weather_ctx is not None:
-                self.ctx_weather.configure(text=format_weather_summary(weather_ctx))
+                self.ctx_weather.configure(
+                    text=format_weather_summary(weather_ctx).replace("\n", " ")
+                )
             else:
-                self.ctx_weather.configure(text="WEATHER:\nUnavailable")
+                self.ctx_weather.configure(text="Weather: Unavailable")
+        carla_display = format_carla_context(data.get("carla"))
+        if self.ctx_carla_vehicle is not None:
+            self.ctx_carla_vehicle.configure(text=f"Vehicle: {carla_display['vehicle']}")
+        if self.ctx_carla_speed is not None:
+            self.ctx_carla_speed.configure(text=f"Speed: {carla_display['speed']}")
+        if self.ctx_carla_weather is not None:
+            self.ctx_carla_weather.configure(text=f"Weather: {carla_display['weather']}")
+        if self.ctx_carla_time is not None:
+            self.ctx_carla_time.configure(text=f"Time: {carla_display['time']}")
+        if self.ctx_carla_session is not None:
+            self.ctx_carla_session.configure(text=f"Driving Session: {carla_display['session']}")
         if getattr(self, "ctx_zone_event", None) is not None:
             zone_event_text = data.get("zone_event") or ""
             if zone_event_text:
