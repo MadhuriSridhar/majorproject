@@ -99,6 +99,22 @@ class CarlaContext:
 
         self.manual_control_active = False
 
+        # Route-following state, built lazily from the configured spawn lane.
+        self.route_waypoints = []
+        self.route_index = 0
+        self.route_complete = False
+        self.current_throttle = 0.0
+        self.current_steer = 0.0
+        self.current_brake = 0.0
+        self.last_control_time: Optional[float] = None
+        self.last_control_status = "INITIALIZING"
+
+        # Weather demo state; transitions are elapsed-time based and applied
+        # only when the active scenario changes.
+        self.weather_demo_started_at: Optional[float] = None
+        self.weather_demo_index = -1
+        self.weather_demo_complete = False
+
     # ===============================================================
     # CARLA CONNECTION
     # ===============================================================
@@ -569,6 +585,92 @@ class CarlaContext:
                 "error": str(exc),
             }
 
+    def _weather_demo_parameters(self, index: int) -> Any:
+        """Return the CARLA weather preset for one demo scenario."""
+
+        presets = ("ClearNoon", "SoftRainNoon", "HardRainNoon", None, "ClearNoon")
+        if index == 3:
+            return carla.WeatherParameters(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                70.0,
+                20.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+        preset = getattr(carla.WeatherParameters, presets[index])
+        return preset() if callable(preset) else preset
+
+    def update_weather_demo(self, now_s: Optional[float] = None) -> bool:
+        """Advance the five-stage, nonblocking 30-second CARLA weather demo."""
+
+        if self.world is None:
+            return False
+
+        now = time.monotonic() if now_s is None else float(now_s)
+        if self.weather_demo_started_at is None:
+            self.weather_demo_started_at = now
+
+        elapsed = max(0.0, now - self.weather_demo_started_at)
+        index = min(4, int(elapsed // 30.0))
+        if self.weather_demo_complete and index == self.weather_demo_index:
+            return True
+        if index == self.weather_demo_index:
+            return True
+
+        try:
+            self.world.set_weather(self._weather_demo_parameters(index))
+            self.weather_demo_index = index
+            self.weather_demo_complete = index == 4 and elapsed >= 120.0
+            labels = ("CLEAR", "RAIN", "HEAVY_RAIN", "FOG", "CLEAR")
+            start = index * 30
+            end = start + 30
+            print(f"CARLA weather demo -> {labels[index]} ({start}-{end}s)")
+            return True
+        except Exception:
+            return False
+
+    def get_carla_location_context(self) -> Dict[str, Any]:
+        """Return virtual CARLA geography classified from current x/y."""
+
+        try:
+            from location_context import carla_sim_location_context
+
+            position = self.get_vehicle_position()
+            context = carla_sim_location_context(
+                position.get("x"),
+                position.get("y"),
+                position.get("z"),
+            )
+            return {
+                "latitude": context.latitude,
+                "longitude": context.longitude,
+                "zone_type": context.zone_type,
+                "zone_name": context.zone_name,
+                "risk_level": context.risk_level,
+                "source": context.source,
+                "available": context.available,
+                "mode": context.mode,
+            }
+        except Exception:
+            return {
+                "latitude": None,
+                "longitude": None,
+                "zone_type": "none",
+                "zone_name": "Normal Road",
+                "risk_level": 5.0,
+                "source": "CARLA_SIM",
+                "available": False,
+                "mode": "carla_sim",
+            }
+
     # ===============================================================
     # DAY / NIGHT
     # ===============================================================
@@ -782,6 +884,206 @@ class CarlaContext:
     # VEHICLE CONTROL
     # ===============================================================
 
+    @staticmethod
+    def _clamp(value: float, lower: float, upper: float) -> float:
+        return max(lower, min(upper, value))
+
+    @staticmethod
+    def _angle_difference(first: float, second: float) -> float:
+        return (first - second + 180.0) % 360.0 - 180.0
+
+    def _choose_next_waypoint(self, waypoint: Any) -> Optional[Any]:
+        """Choose the most forward, unvisited driving waypoint."""
+
+        candidates = list(waypoint.next(2.0))
+        if not candidates:
+            return None
+
+        heading = float(waypoint.transform.rotation.yaw)
+        candidates.sort(
+            key=lambda candidate: abs(
+                self._angle_difference(
+                    float(candidate.transform.rotation.yaw),
+                    heading,
+                )
+            )
+        )
+
+        for candidate in candidates:
+            location = candidate.transform.location
+            if all(
+                location.distance(existing.transform.location) > 1.0
+                for existing in self.route_waypoints[-80:]
+            ):
+                return candidate
+
+        return candidates[0]
+
+    def _ensure_route(self) -> bool:
+        """Build a forward route from the vehicle's current road lane."""
+
+        if self.vehicle is None:
+            return False
+
+        if self.route_waypoints:
+            return True
+
+        try:
+            current = self.world.get_map().get_waypoint(
+                self.vehicle.get_location(),
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
+            if current is None:
+                return False
+
+            self.route_waypoints = [current]
+            self.route_index = 0
+            self.route_complete = False
+
+            for _ in range(150):
+                next_waypoint = self._choose_next_waypoint(
+                    self.route_waypoints[-1]
+                )
+                if next_waypoint is None:
+                    self.route_complete = True
+                    break
+                self.route_waypoints.append(next_waypoint)
+
+            return True
+
+        except Exception:
+            return False
+
+    def _advance_route(self) -> None:
+        """Advance monotonically once the vehicle reaches its target."""
+
+        if self.vehicle is None:
+            return
+
+        vehicle_location = self.vehicle.get_location()
+        while self.route_index < len(self.route_waypoints) - 1:
+            target = self.route_waypoints[self.route_index]
+            if vehicle_location.distance(target.transform.location) > 3.0:
+                break
+            self.route_index += 1
+
+        if self.route_complete or len(self.route_waypoints) - self.route_index > 20:
+            return
+
+        for _ in range(80):
+            next_waypoint = self._choose_next_waypoint(
+                self.route_waypoints[-1]
+            )
+            if next_waypoint is None:
+                self.route_complete = True
+                break
+            self.route_waypoints.append(next_waypoint)
+
+    def _route_geometry(self) -> tuple[float, str, Any]:
+        """Return upcoming curvature, label, and distance-based target."""
+
+        self._advance_route()
+        current = self.route_waypoints[self.route_index]
+        target_index = self.route_index
+        lookahead = max(8.0, min(24.0, 8.0 + self.get_speed_kmh() * 0.25))
+        travelled = 0.0
+
+        while target_index < len(self.route_waypoints) - 1:
+            next_waypoint = self.route_waypoints[target_index + 1]
+            travelled += next_waypoint.transform.location.distance(
+                self.route_waypoints[target_index].transform.location
+            )
+            target_index += 1
+            if travelled >= lookahead:
+                break
+
+        curvature = 0.0
+        if target_index > self.route_index:
+            curvature = abs(
+                self._angle_difference(
+                    float(
+                        self.route_waypoints[target_index].transform.rotation.yaw
+                    ),
+                    float(current.transform.rotation.yaw),
+                )
+            )
+
+        if curvature >= 45.0:
+            label = "SHARP_TURN"
+        elif curvature >= 15.0:
+            label = "TURN"
+        else:
+            label = "STRAIGHT"
+
+        return curvature, label, self.route_waypoints[target_index]
+
+    def _apply_route_control(self, dt: float) -> bool:
+        """Compute and smoothly apply one route-following update."""
+
+        if not self._ensure_route():
+            return False
+
+        if self.route_complete and self.route_index >= len(self.route_waypoints) - 1:
+            target_speed = 0.0
+            label = "ROUTE_END"
+            target_steer = 0.0
+        else:
+            curvature, label, target = self._route_geometry()
+            relative = self.vehicle.get_transform().inverse_transform(
+                target.transform.location
+            )
+            target_steer = self._clamp(
+                math.atan2(relative.y, max(0.1, relative.x)) / math.radians(45.0),
+                -1.0,
+                1.0,
+            )
+
+            target_speed = 42.0
+            if curvature >= 45.0:
+                target_speed = 16.0
+            elif curvature >= 15.0:
+                target_speed = 25.0
+
+            weather_risk = self.get_weather_context().get("risk", 0.0)
+            target_speed -= min(8.0, float(weather_risk) * 0.08)
+
+        speed = self.get_speed_kmh()
+        target_throttle = self._clamp((target_speed - speed) / 12.0, 0.0, 0.75)
+        target_brake = 0.0
+        if speed > target_speed + 2.0:
+            target_brake = self._clamp((speed - target_speed) / 12.0, 0.0, 0.65)
+            target_throttle = 0.0
+        if target_speed == 0.0:
+            target_brake = self._clamp(speed / 8.0, 0.0, 1.0)
+            target_throttle = 0.0
+
+        self.current_steer += self._clamp(
+            target_steer - self.current_steer,
+            -2.0 * dt,
+            2.0 * dt,
+        )
+        self.current_throttle += self._clamp(
+            target_throttle - self.current_throttle,
+            -0.7 * dt,
+            0.7 * dt,
+        )
+        self.current_brake += self._clamp(
+            target_brake - self.current_brake,
+            -1.5 * dt,
+            1.5 * dt,
+        )
+
+        self.vehicle.apply_control(
+            carla.VehicleControl(
+                throttle=self._clamp(self.current_throttle, 0.0, 1.0),
+                steer=self._clamp(self.current_steer, -1.0, 1.0),
+                brake=self._clamp(self.current_brake, 0.0, 1.0),
+            )
+        )
+        self.last_control_status = label
+        return True
+
     def start_moving(
         self,
         throttle: float = 0.4,
@@ -797,33 +1099,24 @@ class CarlaContext:
 
         try:
 
-            throttle = max(
-                0.0,
-                min(
-                    1.0,
-                    throttle,
-                ),
-            )
-
-            steer = max(
-                -1.0,
-                min(
-                    1.0,
-                    steer,
-                ),
-            )
-
             self.vehicle.set_autopilot(
                 False
             )
 
-            self.vehicle.apply_control(
-                carla.VehicleControl(
-                    throttle=throttle,
-                    steer=steer,
-                    brake=0.0,
+            now = time.monotonic()
+            if self.last_control_time is None:
+                self.last_control_time = now
+                self.vehicle.apply_control(
+                    carla.VehicleControl(
+                        throttle=0.0,
+                        steer=0.0,
+                        brake=0.0,
+                    )
                 )
-            )
+            else:
+                dt = self._clamp(now - self.last_control_time, 0.02, 0.2)
+                self.last_control_time = now
+                self._apply_route_control(dt)
 
             self.manual_control_active = True
 
@@ -851,6 +1144,10 @@ class CarlaContext:
             )
 
             self.manual_control_active = False
+            self.current_throttle = 0.0
+            self.current_steer = 0.0
+            self.current_brake = 1.0
+            self.last_control_time = None
 
             return True
 
@@ -886,6 +1183,8 @@ class CarlaContext:
             self.get_speed_context()
         )
 
+        self.update_weather_demo()
+
         weather = (
             self.get_weather_context()
         )
@@ -896,6 +1195,10 @@ class CarlaContext:
 
         position = (
             self.get_vehicle_position()
+        )
+
+        location = (
+            self.get_carla_location_context()
         )
 
         return {
@@ -911,6 +1214,12 @@ class CarlaContext:
             "map": (
                 self.get_map_name()
             ),
+
+            # -------------------------------------------------------
+            # SIMULATED LOCATION
+            # -------------------------------------------------------
+
+            "location": location,
 
             # -------------------------------------------------------
             # VEHICLE
@@ -1117,6 +1426,9 @@ def main() -> None:
 
             # Smooth camera update.
             context.follow_vehicle()
+
+            # Tick the existing route controller.
+            context.start_moving()
 
             # Get complete context.
             data = context.get_context()

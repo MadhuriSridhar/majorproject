@@ -3,7 +3,8 @@ GPS / location context for situational risk.
 
 Location Mode:
   - gps / automatic: real GPS (Windows) then IP geolocation; Unavailable if none
-  - demo: forced zone presets (clearly labeled DEMO)
+    - carla_sim: virtual zones classified from CARLA world x/y coordinates
+    - demo: forced zone presets (clearly labeled DEMO)
   - disabled: no location contribution
 
 Never crashes the app when GPS/network is unavailable.
@@ -84,6 +85,74 @@ class GeofenceZone:
     longitude: float
     radius_m: float
     risk_level: float  # 0..100
+
+
+@dataclass(frozen=True)
+class CarlaZone:
+    """A virtual CARLA-world zone bounded by simulated x/y coordinates."""
+
+    name: str
+    zone_type: str
+    min_x: float
+    max_x: float
+    min_y: float
+    max_y: float
+    risk_level: float
+
+    def contains(self, x: float, y: float) -> bool:
+        return self.min_x <= x <= self.max_x and self.min_y <= y <= self.max_y
+
+
+# These are virtual zones, not real-world semantic data supplied by CARLA.
+# Projects can replace the bounds for their loaded map without changing the
+# classifier or its Normal Road fallback.
+CARLA_SIM_ZONES: tuple[CarlaZone, ...] = (
+    CarlaZone("School Zone", "school", -120.0, -20.0, -80.0, 20.0, 70.0),
+    CarlaZone("Accident / High-Risk Zone", "accident", 20.0, 120.0, -80.0, -20.0, 85.0),
+    CarlaZone("Construction Zone", "construction", 20.0, 120.0, 20.0, 80.0, 55.0),
+    CarlaZone("Pedestrian Zone", "pedestrian", -120.0, -20.0, 20.0, 80.0, 65.0),
+)
+
+
+def classify_carla_zone(
+    x: float | None,
+    y: float | None,
+    zones: tuple[CarlaZone, ...] | list[CarlaZone] | None = None,
+) -> tuple[str, str, float]:
+    """Classify virtual geography from the vehicle's current CARLA x/y."""
+
+    try:
+        world_x = float(x)
+        world_y = float(y)
+    except (TypeError, ValueError):
+        return "none", "Normal Road", BASELINE_LOCATION_RISK
+
+    for zone in zones if zones is not None else CARLA_SIM_ZONES:
+        if zone.contains(world_x, world_y):
+            return zone.zone_type, zone.name, float(zone.risk_level)
+    return "none", "Normal Road", BASELINE_LOCATION_RISK
+
+
+def carla_sim_location_context(
+    x: float | None,
+    y: float | None,
+    z: float | None = None,
+    zones: tuple[CarlaZone, ...] | list[CarlaZone] | None = None,
+) -> LocationContext:
+    """Build an available location context from simulated CARLA coordinates."""
+
+    zone_type, zone_name, risk = classify_carla_zone(x, y, zones)
+    return LocationContext(
+        latitude=float(x) if x is not None else None,
+        longitude=float(y) if y is not None else None,
+        zone_type=zone_type,
+        zone_name=zone_name,
+        risk_level=risk,
+        source="CARLA_SIM",
+        place_name="CARLA simulated world",
+        available=x is not None and y is not None,
+        mode="carla_sim",
+    )
 
 
 # Optional real-world geofence dataset (user-configurable, kept empty by
@@ -269,7 +338,7 @@ def format_location_summary(ctx: LocationContext) -> str:
 
 
 class LocationRiskProvider:
-    """Throttled location provider with GPS / Demo / Disabled modes."""
+    """Throttled location provider with GPS / CARLA_SIM / Demo modes."""
 
     def __init__(
         self,
@@ -286,6 +355,18 @@ class LocationRiskProvider:
         self._last_ctx = self._unavailable("Unavailable")
         self._geofences = load_geofences()
         self._load_cache()
+
+    def update_carla(
+        self,
+        x: float | None,
+        y: float | None,
+        z: float | None = None,
+    ) -> LocationContext:
+        """Update from CARLA world coordinates; elapsed time never changes zones."""
+
+        self.mode = "carla_sim"
+        self._last_ctx = carla_sim_location_context(x, y, z)
+        return self._last_ctx
 
     def reload_geofences(self) -> None:
         """Re-read the configurable geofence dataset at runtime."""
@@ -466,6 +547,9 @@ class LocationRiskProvider:
         mode = self.mode
         if mode in ("disabled", "off", "none"):
             self._last_ctx = self._unavailable("Disabled", mode="disabled")
+            return self._last_ctx
+
+        if mode in ("carla_sim", "carla"):
             return self._last_ctx
 
         if mode == "demo":
