@@ -158,15 +158,40 @@ def format_carla_context(context: dict | None) -> dict[str, str]:
 
     weather = snapshot.get("weather") or {}
     time_context = snapshot.get("time") or {}
+    location = snapshot.get("location") or {}
+    position = snapshot.get("position") or {}
     vehicle = str(snapshot.get("vehicle_state") or "NO_VEHICLE").upper()
     speed = float(snapshot.get("speed_kmh") or 0.0)
     session_id = snapshot.get("driving_session_id")
+
+    zone_name = str(location.get("zone_name") or "Normal Road")
+    zone_type = str(location.get("zone_type") or "none")
+    if zone_type in {"none", "", "unknown"}:
+        zone_name = "Normal Road"
+    risk_value = int(round(float(location.get("risk_level") or 0.0)))
+
+    pos_x = 0.0
+    pos_y = 0.0
+    if isinstance(position, dict):
+        try:
+            pos_x = float(position.get("x") or 0.0)
+            pos_y = float(position.get("y") or 0.0)
+        except (TypeError, ValueError):
+            pos_x = 0.0
+            pos_y = 0.0
+    carla_position = f"x={pos_x:.1f}, y={pos_y:.1f}"
+
     return {
         "vehicle": vehicle,
         "speed": f"{speed:.1f} km/h",
         "weather": str(weather.get("condition") or "UNKNOWN").upper(),
         "time": str(time_context.get("period") or "UNKNOWN").upper(),
         "session": str(session_id) if session_id else "--",
+        "zone": zone_name,
+        "position": carla_position,
+        "zone_risk": f"{risk_value}/100",
+        "carla_zone": zone_name,
+        "carla_position": carla_position,
     }
 
 
@@ -178,19 +203,51 @@ FACE_LOSS_GRACE_S = 1.5
 
 
 def create_optional_carla_context():
-    """Create CARLA context only when explicitly enabled and available."""
-    if os.environ.get("CARLA_ENABLED", "0").strip().lower() not in {"1", "true", "yes"}:
+    """Create CARLA context automatically when a CARLA server is available.
+
+    The application attempts to connect to localhost:2000 by default. If a
+    CARLA server is reachable, the existing CarlaContext is created and used
+    for vehicle/environment context. If CARLA is unavailable, the application
+    gracefully shows unavailable context and continues without CARLA.
+
+    The user does NOT need to manually set CARLA_ENABLED, CARLA_ROOT, or
+    PYTHONPATH. These remain available as overrides for advanced use cases.
+    """
+    # Allow explicit override for advanced users, but default to automatic
+    # detection when no override is specified.
+    explicit_disabled = os.environ.get("CARLA_ENABLED", "").strip().lower() in {"0", "false", "no", "off"}
+    if explicit_disabled:
         return None
+
+    host = os.environ.get("CARLA_HOST", "localhost")
+    port = int(os.environ.get("CARLA_PORT", "2000"))
+
+    # Quick connectivity check before attempting full context creation.
+    # This avoids blocking on a long timeout when no CARLA server is running.
+    if not _carla_host_reachable(host, port):
+        return None
+
     try:
         from carla_context import CarlaContext
 
-        return CarlaContext(
-            host=os.environ.get("CARLA_HOST", "localhost"),
-            port=int(os.environ.get("CARLA_PORT", "2000")),
-        )
+        return CarlaContext(host=host, port=port)
     except Exception as exc:
         print(f"CARLA context unavailable: {exc}")
         return None
+
+
+def _carla_host_reachable(host: str, port: int, timeout_s: float = 2.0) -> bool:
+    """Check whether a CARLA server is reachable on the given host/port.
+
+    Uses a short TCP connect timeout so the check is non-blocking when no
+    server is running.
+    """
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
 
 
 def head_is_down(head) -> bool:
@@ -1268,6 +1325,11 @@ class DrowsinessApp(tk.Tk):
         self._last_camera_state = None
         self.trend_canvas: tk.Canvas | None = None
         self.rb_table: tk.Frame | None = None
+        self._last_rendered_history_len = -1
+        self._last_rendered_alert_event_count = -1
+        self._last_history_render_s = 0.0
+        self._last_history_render_mode: str | None = None
+        self._last_camera_render_s = 0.0
         self._driver_metrics: dict[str, tk.Label] = {}
 
         self._build_start_screen()
@@ -1275,7 +1337,7 @@ class DrowsinessApp(tk.Tk):
 
         # Start camera on startup (for preview on start screen).
         ensure_sounds_generated()
-        self.camera_worker.start_camera()
+        self._start_camera_async()
 
         # Poll camera state.
         self.after(50, self._poll_camera)
@@ -1359,6 +1421,10 @@ class DrowsinessApp(tk.Tk):
         self._destroy_dashboard_ui()
         self._clear_screen()
         self.current_screen = "dashboard"
+        self._last_rendered_history_len = -1
+        self._last_rendered_alert_event_count = -1
+        self._last_history_render_s = 0.0
+        self._last_rendered_history_mode = None
         self._build_top_taskbar()
         self._build_main_dashboard()
 
@@ -1429,6 +1495,7 @@ class DrowsinessApp(tk.Tk):
         # Compact CARLA context card between the camera and right-side panels.
         self.ctx_carla_vehicle = self.ctx_carla_speed = None
         self.ctx_carla_weather = self.ctx_carla_time = self.ctx_carla_session = None
+        self.ctx_carla_zone = self.ctx_carla_position = self.ctx_carla_zone_risk = None
         carla_panel = tk.Frame(
             top,
             bg=BG_CARD,
@@ -1436,7 +1503,7 @@ class DrowsinessApp(tk.Tk):
             highlightthickness=1,
             highlightbackground="#2a3040",
             width=210,
-            height=320,
+            height=360,
         )
         carla_panel.pack(side="left", fill="y", padx=(0, 6))
         carla_panel.pack_propagate(False)
@@ -1456,6 +1523,12 @@ class DrowsinessApp(tk.Tk):
         self.ctx_carla_weather.pack(fill="x", padx=10, pady=3)
         self.ctx_carla_time = tk.Label(carla_panel, text="Time: --", font=FONT_SMALL, bg=BG_CARD, fg=FG, anchor="w")
         self.ctx_carla_time.pack(fill="x", padx=10, pady=3)
+        self.ctx_carla_zone = tk.Label(carla_panel, text="CARLA Zone: --", font=FONT_SMALL, bg=BG_CARD, fg=FG, anchor="w", wraplength=185, justify="left")
+        self.ctx_carla_zone.pack(fill="x", padx=10, pady=3)
+        self.ctx_carla_position = tk.Label(carla_panel, text="CARLA Position: --", font=FONT_SMALL, bg=BG_CARD, fg=FG, anchor="w", wraplength=185, justify="left")
+        self.ctx_carla_position.pack(fill="x", padx=10, pady=3)
+        self.ctx_carla_zone_risk = tk.Label(carla_panel, text="Zone Risk: --", font=FONT_SMALL, bg=BG_CARD, fg=FG, anchor="w")
+        self.ctx_carla_zone_risk.pack(fill="x", padx=10, pady=3)
         self.ctx_carla_session = tk.Label(carla_panel, text="Driving Session: --", font=FONT_SMALL, bg=BG_CARD, fg=FG, anchor="w", wraplength=185, justify="left")
         self.ctx_carla_session.pack(fill="x", padx=10, pady=3)
 
@@ -1589,6 +1662,7 @@ class DrowsinessApp(tk.Tk):
         self.rb_content.pack(fill="both", expand=True, padx=10, pady=6)
         self.trend_canvas = tk.Canvas(self.rb_content, bg=BG_CARD, height=150, highlightthickness=0)
         self.trend_canvas.pack(fill="both", expand=True)
+        self.trend_canvas.bind("<Configure>", self._on_history_canvas_configure)
         self.rb_table = tk.Frame(self.rb_content, bg=BG_CARD)
         # Wrap the table so wrapped rows never extend beyond the bounded panel.
         self.rb_table_container = tk.Frame(self.rb_content, bg=BG_CARD)
@@ -1673,6 +1747,13 @@ class DrowsinessApp(tk.Tk):
             self.trend_btn.configure(bg=BG_INPUT, fg=FG)
             self.table_btn.configure(bg=ACCENT, fg="#fff")
         if self.current_screen == "dashboard":
+            self._last_history_render_mode = None
+            self._update_alertness_history_view()
+
+    def _on_history_canvas_configure(self, _event=None) -> None:
+        """Invalidate the cached chart when its drawable area changes."""
+        if self.current_screen == "dashboard" and self._trend_mode == "TREND":
+            self._last_rendered_history_mode = None
             self._update_alertness_history_view()
 
     def _build_summary_screen(self, stats) -> None:
@@ -1806,7 +1887,15 @@ class DrowsinessApp(tk.Tk):
             settings_store=self.settings_store,
             carla_context=self.carla_context,
         )
-        self.camera_worker.start_camera()
+        self._start_camera_async()
+
+    def _start_camera_async(self) -> None:
+        """Initialize camera resources off the Tkinter event thread."""
+        threading.Thread(
+            target=self.camera_worker.start_camera,
+            name="camera-startup",
+            daemon=True,
+        ).start()
 
     def _export_pdf(self) -> None:
         stats = self._summary_stats or self.session_manager.stats
@@ -1885,10 +1974,15 @@ class DrowsinessApp(tk.Tk):
                 self.camera_status_label.configure(text="CAMERA: STARTING", fg=FG_MUTED)
 
         # Pull latest frame state.
+        # Keep only the newest state for the UI. The worker queue is bounded,
+        # but draining it here prevents the dashboard from rendering stale
+        # frames when detection briefly outpaces Tkinter.
+        data = None
         try:
-            data = self.camera_worker.frame_queue.get_nowait()
+            while True:
+                data = self.camera_worker.frame_queue.get_nowait()
         except queue.Empty:
-            data = None
+            pass
 
         if data is not None:
             self._last_decision = data["decision"]
@@ -1945,19 +2039,24 @@ class DrowsinessApp(tk.Tk):
 
         # Camera display: stable 16:9 preview that preserves aspect ratio and
         # keeps the dashboard layout consistent without zooming or cropping.
-        h, w = frame.shape[:2]
-        target_w = 640
-        target_h = 360
-        scale = min(target_w / w, target_h / h)
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
-        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        imgtk = ImageTk.PhotoImage(img)
-        if self.cam_label is not None:
-            self.cam_label.configure(image=imgtk, text="")
-            self.cam_label.image = imgtk
+        # State/metrics continue updating at the polling rate; only the
+        # expensive Tk image conversion is limited to a responsive UI rate.
+        now_s = time.monotonic()
+        if now_s - self._last_camera_render_s >= 1.0 / 12.0:
+            h, w = frame.shape[:2]
+            target_w = 640
+            target_h = 360
+            scale = min(target_w / w, target_h / h)
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb)
+            imgtk = ImageTk.PhotoImage(img)
+            if self.cam_label is not None:
+                self.cam_label.configure(image=imgtk, text="")
+                self.cam_label.image = imgtk
+            self._last_camera_render_s = now_s
 
         # Camera overlay.
         if not self.session_manager.active:
@@ -2169,6 +2268,12 @@ class DrowsinessApp(tk.Tk):
             self.ctx_carla_weather.configure(text=f"Weather: {carla_display['weather']}")
         if self.ctx_carla_time is not None:
             self.ctx_carla_time.configure(text=f"Time: {carla_display['time']}")
+        if self.ctx_carla_zone is not None:
+            self.ctx_carla_zone.configure(text=f"CARLA Zone: {carla_display['carla_zone']}")
+        if self.ctx_carla_position is not None:
+            self.ctx_carla_position.configure(text=f"CARLA Position: {carla_display['carla_position']}")
+        if self.ctx_carla_zone_risk is not None:
+            self.ctx_carla_zone_risk.configure(text=f"Zone Risk: {carla_display['zone_risk']}")
         if self.ctx_carla_session is not None:
             self.ctx_carla_session.configure(text=f"Driving Session: {carla_display['session']}")
         if getattr(self, "ctx_zone_event", None) is not None:
@@ -2415,13 +2520,28 @@ class DrowsinessApp(tk.Tk):
         if self.trend_canvas is None or self.rb_table is None:
             return
         history = self.session_manager.stats.alertness_history
-        self.trend_canvas.delete("all")
-        for child in self.rb_table.winfo_children():
-            child.destroy()
+        history_len = len(history)
+        event_count = len(self.session_manager.stats.alert_events)
+        now_s = time.monotonic()
+        mode_changed = self._last_rendered_history_mode != self._trend_mode
+
+        if self._trend_mode == "TABLE":
+            data_changed = event_count != self._last_rendered_alert_event_count
+        else:
+            data_changed = history_len != self._last_rendered_history_len
+        if not mode_changed and not data_changed and now_s - self._last_history_render_s < 1.0:
+            return
+
+        self._last_rendered_history_len = history_len
+        self._last_rendered_alert_event_count = event_count
+        self._last_history_render_s = now_s
+        self._last_rendered_history_mode = self._trend_mode
 
         if self._trend_mode == "TABLE":
             self.trend_canvas.pack_forget()
             self.rb_table_container.pack(fill="both", expand=True)
+            for child in self.rb_table.winfo_children():
+                child.destroy()
             headers = ("TIME", "EVENT", "SEVERITY", "PRIMARY REASON", "ALERTNESS", "ACTION")
             for col, header in enumerate(headers):
                 tk.Label(self.rb_table, text=header, font=FONT_SMALL, bg=BG_CARD, fg=ACCENT, anchor="w").grid(
@@ -2463,6 +2583,7 @@ class DrowsinessApp(tk.Tk):
                 self.rb_table.columnconfigure(col, weight=1 if col in (3, 5) else 0)
             return
 
+        self.trend_canvas.delete("all")
         self.rb_table_container.pack_forget()
         self.trend_canvas.pack(fill="both", expand=True)
         self.trend_canvas.create_text(10, 8, anchor="nw", text="ATTENTION TREND", fill=FG_MUTED, font=FONT_SMALL)

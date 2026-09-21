@@ -73,10 +73,32 @@ ALERT_EXIT = 32.0
 
 # WARNING (HIGH) requires a short persistence before it is emitted so a
 # single-frame / very brief risk spike cannot fire a serious alarm.
+#
+# The persistence is ACCUMULATED per pending severity (see
+# `_derive_alert_severity`): the accumulator only grows while the band that
+# maps to that severity is actually present, and it is never wiped by an
+# intermediate band crossing. Before this, a risk value that flickered across
+# the HIGH/CRITICAL boundary (e.g. 73 <-> 84 around the 74 band edge) reset the
+# pending escalation on every crossing, so a 77+ attention risk could stay at
+# WARNING (or below) forever and never reach the alert/audio path.
 ALERT_PERSISTENCE_S = 0.75
 WARNING_PERSISTENCE_S = 1.00
 DROWSY_PERSISTENCE_S = 1.50
 RECOVERY_PERSISTENCE_S = 1.25
+
+# A context-scaled persistence window may never shrink below this (a single
+# frame must never fire a serious alarm, even in the riskiest context).
+PERSISTENCE_MIN_S = 0.30
+# Pending escalations keep a short retention window after the band drops away so
+# a brief flicker cannot discard a genuine rising alert. This is deliberately
+# longer than the per-band checks to avoid flapping between higher severities.
+PENDING_ESCALATION_TTL_S = max(
+    PERSISTENCE_MIN_S,
+    ALERT_PERSISTENCE_S,
+    WARNING_PERSISTENCE_S,
+    DROWSY_PERSISTENCE_S,
+    RECOVERY_PERSISTENCE_S,
+) * 2.0
 
 # Asymmetric decrease (same philosophy as FatigueEngine).
 RISK_DECREASE_HOLD_S = 0.45
@@ -91,6 +113,41 @@ LEVEL_TO_ALERT = {
     "HIGH": "WARNING",
     "CRITICAL": "DROWSY",
 }
+
+# ---------------------------------------------------------------------------
+# Context-sensitive escalation (ordering-only, deterministic)
+# ---------------------------------------------------------------------------
+# A driver who is ALREADY demonstrably degrading (both fatigue and distraction
+# evidence present) needs less proof before the existing escalation fires.
+# This is a modifier on the existing timing only - it never creates risk.
+DRIVER_COMBO_RISK = 40.0  # each axis must reach this to count as "combined"
+DRIVER_COMBO_URGENCY_GAIN = 0.12
+
+# ---------------------------------------------------------------------------
+# Temporal classification of a sustained DOWNWARD head pose.
+# ---------------------------------------------------------------------------
+# A downward head pose alone is NOT drowsiness (the eyes are simply not
+# visible). What it means depends on the driver's state BEFORE the downward
+# pose began, so the classification is latched from temporal history:
+#
+#   prior drowsiness + sustained downward pose -> drowsiness-grade (CASE A)
+#   no prior drowsiness + sustained downward   -> mobile-use-like distraction
+#                                                 (CASE B, behaviour-based; the
+#                                                 camera does NOT prove a phone)
+#
+# Drowsiness evidence in the trailing window before the downward event starts.
+PRIOR_DROWSINESS_WINDOW_S = 20.0
+PRIOR_DROWSINESS_RISK = 45.0
+PRIOR_DROWSINESS_STATUSES = ("WARNING", "DROWSY")
+
+# Bounded drowsiness-grade amplification for CASE A (never unbounded, never
+# applied without genuine pre-existing drowsiness evidence).
+DROWSY_DOWNWARD_MIN_RISK = 75.0  # CRITICAL band floor for the combined event
+DROWSY_DOWNWARD_GAIN = 10.0
+
+HEAD_DOWN_NONE = "none"
+HEAD_DOWN_DROWSY = "drowsy_looking_down"
+HEAD_DOWN_MOBILE_USE = "mobile_use_like"
 
 
 @dataclass(frozen=True)
@@ -122,6 +179,12 @@ class AttentionDecision:
     carla_speed_risk: float = 0.0
     carla_vehicle_state: str = "UNAVAILABLE"
     carla_time_period: str = "UNKNOWN"
+    # Temporal head-down classification (PART 8):
+    # none | drowsy_looking_down | mobile_use_like
+    head_down_classification: str = "none"
+    # The severity/level the UI shows always comes from this decision, and the
+    # alert/audio path is driven by `alert_severity` from the same computation.
+    pending_escalation: str = "NONE"  # escalation being confirmed (for triage)
 
 
 def risk_level_from_score(score: float | None) -> str:
@@ -202,7 +265,7 @@ def apply_context_boost(
     # Moderate distraction + elevated road zone (school / construction / sharp turn).
     if d >= 35.0 and loc >= 55.0:
         boost += 12.0
-    if d >= 35.0 and zone_type == "school":
+    if d >= 35.0 and zone_type == "school" and float(time_risk or 0.0) <= 0.0:
         boost += 6.0
 
     # Moderate distraction + rain / severe weather.
@@ -222,6 +285,8 @@ def context_urgency_from(
     zone_type: str = "none",
     speed_risk: float = 0.0,
     time_risk: float = 0.0,
+    fatigue_risk: float = 0.0,
+    distraction_risk: float = 0.0,
 ) -> float:
     """Deterministic context urgency modifier (1.0 = normal, lower = more urgent).
 
@@ -231,6 +296,12 @@ def context_urgency_from(
     ``[CONTEXT_URGENCY_MIN, CONTEXT_URGENCY_NORMAL]`` so it can never exceed
     safe bounds.
 
+    ``fatigue_risk`` / ``distraction_risk`` add the *driver* half of the same
+    ordering rule: when the driver is already demonstrably degrading on BOTH
+    axes (combined fatigue + distraction), an existing behavioural alert may
+    escalate sooner. Both default to 0.0, so the context-only behaviour (and
+    every existing caller/test) is unchanged.
+
     This value is an *ordering* modifier for alert escalation (shorter
     cooldown / faster escalation). It does not raise the raw risk score and can
     never create a fatigue or distraction claim on its own.
@@ -239,6 +310,8 @@ def context_urgency_from(
     wx = max(0.0, min(100.0, float(weather_risk or 0.0)))
     speed = max(0.0, min(100.0, float(speed_risk or 0.0)))
     time = max(0.0, min(100.0, float(time_risk or 0.0)))
+    fatigue = max(0.0, min(100.0, float(fatigue_risk or 0.0)))
+    distraction = max(0.0, min(100.0, float(distraction_risk or 0.0)))
     zone = (zone_type or "none").strip().lower()
 
     reduction = 0.0
@@ -255,10 +328,127 @@ def context_urgency_from(
     if time >= CONTEXT_TIME_HIGH_RISK:
         reduction += 0.08
     if zone in ZONE_URGENCY:
-        reduction += ZONE_URGENCY[zone]
+        if zone == "school" and time >= CONTEXT_TIME_HIGH_RISK:
+            reduction += 0.2 * ZONE_URGENCY[zone]
+        else:
+            reduction += ZONE_URGENCY[zone]
+    # Combined fatigue + distraction: the weakest axis still has to be real
+    # evidence (>= DRIVER_COMBO_RISK), and the gain scales with the weaker axis
+    # so a mild combination never becomes urgent.
+    if fatigue >= DRIVER_COMBO_RISK and distraction >= DRIVER_COMBO_RISK:
+        weakest = min(fatigue, distraction)
+        reduction += DRIVER_COMBO_URGENCY_GAIN * (
+            (weakest - DRIVER_COMBO_RISK) / (100.0 - DRIVER_COMBO_RISK)
+        )
 
     reduction = min(CONTEXT_URGENCY_MAX_REDUCTION, reduction)
     return float(max(CONTEXT_URGENCY_MIN, CONTEXT_URGENCY_NORMAL - reduction))
+
+
+class DownwardGazeTemporalClassifier:
+    """Classify a sustained downward head pose using PRE-EVENT history.
+
+    The current frame alone cannot decide what a downward head pose means, so
+    the classifier keeps temporal state:
+
+    * It continuously records when genuine drowsiness evidence was last present
+      (fatigue risk at/above ``PRIOR_DROWSINESS_RISK`` or a fatigue status of
+      WARNING/DROWSY - prolonged eye closure reaches those bands on its own).
+    * When a sustained downward-looking distraction event STARTS, the pre-event
+      drowsiness state is latched once and kept for the whole event.
+    * ``drowsy_looking_down``  - drowsiness existed BEFORE the downward pose
+      (CASE A: the combined event is drowsiness-grade, not plain distraction).
+    * ``mobile_use_like``      - no drowsiness was established before the
+      downward pose began (CASE B: behaviour-based mobile-use-like distraction).
+      This is a behavioural classification only: no phone/hand model exists, so
+      the system never claims a phone was detected.
+
+    Deliberately NOT implemented: ``if looking_down: drowsy``.
+    """
+
+    def __init__(
+        self,
+        prior_window_s: float = PRIOR_DROWSINESS_WINDOW_S,
+        prior_risk: float = PRIOR_DROWSINESS_RISK,
+        prior_statuses: tuple[str, ...] = PRIOR_DROWSINESS_STATUSES,
+    ) -> None:
+        self.prior_window_s = max(0.0, float(prior_window_s))
+        self.prior_risk = float(prior_risk)
+        self.prior_statuses = tuple(prior_statuses)
+        self._last_drowsy_s: float | None = None
+        self._drowsy_since_s: float | None = None
+        self._down_event_active = False
+        self._down_event_started_s: float | None = None
+        self._down_event_prior_drowsy = False
+
+    def reset(self) -> None:
+        self._last_drowsy_s = None
+        self._drowsy_since_s = None
+        self._down_event_active = False
+        self._down_event_started_s = None
+        self._down_event_prior_drowsy = False
+
+    @property
+    def prior_drowsiness_present(self) -> bool:
+        """True while the trailing drowsiness window still holds evidence."""
+        return self._last_drowsy_s is not None
+
+    @property
+    def down_event_prior_drowsy(self) -> bool:
+        """The drowsiness state captured before the current downward event."""
+        return bool(self._down_event_prior_drowsy)
+
+    def _looking_down_active(self, distraction) -> bool:
+        if distraction is None:
+            return False
+        channel = getattr(distraction, "looking_down", None)
+        if channel is None:
+            return False
+        if getattr(channel, "active", False):
+            return True
+        # A primary "looking_down" classification is equally valid evidence.
+        return str(getattr(distraction, "primary", "") or "") == "looking_down"
+
+    def update(
+        self,
+        fatigue_risk: float,
+        distraction,
+        now_s: float,
+        fatigue_status: str = "SAFE",
+    ) -> str:
+        """Return none | drowsy_looking_down | mobile_use_like for this frame."""
+        risk = max(0.0, float(fatigue_risk or 0.0))
+        status = str(fatigue_status or "").strip().upper()
+        drowsy = risk >= self.prior_risk or status in self.prior_statuses
+        if drowsy:
+            self._last_drowsy_s = float(now_s)
+            if self._drowsy_since_s is None:
+                self._drowsy_since_s = float(now_s)
+        else:
+            self._drowsy_since_s = None
+
+        looking_down = self._looking_down_active(distraction)
+        if looking_down:
+            if not self._down_event_active:
+                # Event START: latch the drowsiness state that existed BEFORE
+                # this downward pose (trailing window, never the current frame).
+                self._down_event_active = True
+                self._down_event_started_s = float(now_s)
+                self._down_event_prior_drowsy = bool(
+                    self._last_drowsy_s is not None
+                    and (float(now_s) - self._last_drowsy_s) <= self.prior_window_s
+                )
+            return (
+                HEAD_DOWN_DROWSY
+                if self._down_event_prior_drowsy
+                else HEAD_DOWN_MOBILE_USE
+            )
+
+        # Event ended: the next downward pose is classified from fresh history.
+        self._down_event_active = False
+        self._down_event_started_s = None
+        self._down_event_prior_drowsy = False
+        return HEAD_DOWN_NONE
 
 
 class AttentionEngine:
@@ -277,6 +467,8 @@ class AttentionEngine:
         self.risk_decrease_hold_s = max(0.0, float(risk_decrease_hold_s))
         self.risk_decrease_tau_s = max(0.05, float(risk_decrease_tau_s))
         self.risk_increase_alpha = min(0.99, max(0.05, float(risk_increase_alpha)))
+        # Temporal classification of a sustained downward head pose (PART 8).
+        self.head_down_classifier = DownwardGazeTemporalClassifier()
         self.reset()
 
     def reset(self) -> None:
@@ -286,18 +478,36 @@ class AttentionEngine:
         self._last_update_s: float | None = None
         self._alert_severity = "NORMAL"
         self._warning_pending_since: float | None = None
+        # Pending escalation (accumulated, never wiped by an intermediate band):
+        # the severity waiting for its persistence window, the time already
+        # spent at/above that severity, and the previous evaluation moment used
+        # to accumulate the elapsed time.
         self._pending_alert_target: str | None = None
-        self._pending_alert_since: float | None = None
+        self._pending_alert_priority: int = 0
+        self._pending_alert_accum_s: float = 0.0
+        self._last_escalation_eval_s: float | None = None
         self._recovery_since: float | None = None
+        if getattr(self, "head_down_classifier", None) is not None:
+            self.head_down_classifier.reset()
 
     def _derive_alert_severity(
-        self, smoothed: float | None, level: str, now_s: float
+        self,
+        smoothed: float | None,
+        level: str,
+        now_s: float,
+        context_urgency: float = CONTEXT_URGENCY_NORMAL,
     ) -> str:
         """Map smoothed attention risk to an alert severity with hysteresis.
 
         - LOW_FATIGUE <-> ALERT uses entry/exit hysteresis inside MODERATE.
-        - WARNING (HIGH) requires a short persistence before being emitted.
-        - CRITICAL escalates to DROWSY immediately (genuinely severe evidence).
+        - WARNING (HIGH) / DROWSY (CRITICAL) require a short *accumulated*
+          persistence before being emitted, so a single-frame spike cannot fire
+          a serious alarm, while a persistently high risk value always does.
+        - The persistence window is scaled by the existing deterministic context
+          urgency: in a genuinely high-risk context (night / adverse weather /
+          high-risk zone / high speed / combined fatigue+distraction) the same
+          high risk value escalates sooner. Normal context keeps the configured
+          window unchanged.
         """
         if level == "SAFE":
             target = "NORMAL"
@@ -316,25 +526,63 @@ class AttentionEngine:
             target = "DROWSY"
 
         priority = {"NORMAL": 0, "LOW_FATIGUE": 1, "ALERT": 2, "WARNING": 3, "DROWSY": 4}
+        urgency = max(CONTEXT_URGENCY_MIN, min(CONTEXT_URGENCY_NORMAL, float(context_urgency)))
         persistence = {
-            "ALERT": ALERT_PERSISTENCE_S,
-            "WARNING": WARNING_PERSISTENCE_S,
-            "DROWSY": DROWSY_PERSISTENCE_S,
+            "ALERT": max(PERSISTENCE_MIN_S, ALERT_PERSISTENCE_S * urgency),
+            "WARNING": max(PERSISTENCE_MIN_S, WARNING_PERSISTENCE_S * urgency),
+            "DROWSY": max(PERSISTENCE_MIN_S, DROWSY_PERSISTENCE_S * urgency),
         }
+
+        # Elapsed time since the previous evaluation (this is the amount the
+        # current frame can contribute to / take away from the persistence).
+        previous_eval_s = self._last_escalation_eval_s
+        self._last_escalation_eval_s = float(now_s)
+        dt = 0.0 if previous_eval_s is None else max(0.0, float(now_s) - previous_eval_s)
+
         current_priority = priority.get(self._alert_severity, 0)
         target_priority = priority.get(target, 0)
+
+        # A pending escalation is dropped only when it can no longer escalate
+        # (its severity is no longer above the confirmed severity) or when the
+        # band that produced it has been absent for longer than the retention
+        # window. A short crossing of a lower band (the HIGH/CRITICAL flicker in
+        # the original bug) must NOT discard it.
+        if self._pending_alert_target is not None and self._pending_alert_priority <= current_priority:
+            self._pending_alert_target = None
+            self._pending_alert_priority = 0
+            self._pending_alert_accum_s = 0.0
+            self._pending_alert_last_seen_s = None
+        if (
+            self._pending_alert_target is not None
+            and self._pending_alert_last_seen_s is not None
+            and (float(now_s) - self._pending_alert_last_seen_s) > PENDING_ESCALATION_TTL_S
+        ):
+            self._pending_alert_target = None
+            self._pending_alert_priority = 0
+            self._pending_alert_accum_s = 0.0
+            self._pending_alert_last_seen_s = None
+
         if target_priority > current_priority and target in persistence:
-            if self._pending_alert_target != target or self._pending_alert_since is None:
+            if self._pending_alert_target is None or target_priority > self._pending_alert_priority:
+                # A new / strictly stronger escalation starts its own window.
                 self._pending_alert_target = target
-                self._pending_alert_since = now_s
-                return self._alert_severity
-            if now_s - self._pending_alert_since < persistence[target]:
+                self._pending_alert_priority = target_priority
+                self._pending_alert_accum_s = dt
+                self._pending_alert_last_seen_s = float(now_s)
+            elif target_priority == self._pending_alert_priority:
+                # Same pending severity is present again -> its evidence time
+                # keeps accumulating (this is what makes a repeatedly recurring
+                # high risk escalate instead of flickering below the latch).
+                self._pending_alert_accum_s += dt
+                self._pending_alert_last_seen_s = float(now_s)
+
+            pending = self._pending_alert_target
+            if pending is None or self._pending_alert_accum_s < persistence.get(pending, 0.0):
                 return self._alert_severity
             self._pending_alert_target = None
-            self._pending_alert_since = None
-        elif target_priority <= current_priority:
-            self._pending_alert_target = None
-            self._pending_alert_since = None
+            self._pending_alert_priority = 0
+            self._pending_alert_accum_s = 0.0
+            self._pending_alert_last_seen_s = None
 
         if target_priority < current_priority:
             if self._recovery_since is None:
@@ -417,6 +665,7 @@ class AttentionEngine:
         location_zone: str = "none",
         weather_condition: str = "unknown",
         carla_context: Mapping[str, Any] | None = None,
+        fatigue_status: str = "SAFE",
     ) -> AttentionDecision:
         if not face_ok:
             self.reset()
@@ -457,30 +706,25 @@ class AttentionEngine:
         zone = str(location_zone or "none")
         wx_cond = str(weather_condition or "unknown")
         if carla.get("carla_connected"):
-            carla_weather_risk = float(carla_weather.get("risk") or 0.0)
-            if carla_weather_risk > 0.0:
-                wx = max(wx, carla_weather_risk)
             # In CARLA simulation, the simulator's weather is the ground truth —
-            # real-world API weather is irrelevant, so CARLA condition takes full
-            # precedence when the simulator is connected.
+            # real-world API weather is irrelevant, so CARLA values take full
+            # precedence and replace caller-supplied values.
+            carla_weather_risk = max(0.0, min(100.0, float(carla_weather.get("risk") or 0.0)))
+            wx = carla_weather_risk
             carla_cond = str(carla_weather.get("condition") or "unknown")
-            if carla_cond and carla_cond != "unknown":
-                wx_cond = carla_cond
+            wx_cond = carla_cond
             # CARLA simulated location replaces GPS-derived values when connected.
-            carla_loc_risk = float(carla_location.get("risk_level") or 0.0)
-            if carla_loc_risk > 0.0:
-                loc = carla_loc_risk
+            carla_loc_risk = max(0.0, min(100.0, float(carla_location.get("risk_level") or 0.0)))
+            loc = carla_loc_risk
             carla_zone = str(carla_location.get("zone_type") or "none")
             if carla_zone and carla_zone != "none":
                 zone = carla_zone
-            elif carla_zone == "none":
-                # CARLA says "none" — use that, don't invent a zone from zone_name.
+            else:
+                # CARLA explicitly says "none" (or empty) — use that, don't invent
+                # a zone from the caller-supplied zone_name.
                 zone = "none"
         vehicle_state = str(carla.get("vehicle_state") or "UNAVAILABLE")
         time_period = str(carla_time.get("period") or "UNKNOWN")
-        context_urgency = context_urgency_from(
-            loc, wx, zone, carla_speed_risk, carla_time_risk
-        )
         head_dir = "unknown"
         if distraction is not None and distraction.head is not None:
             head_dir = str(distraction.head.direction or "unknown")
@@ -496,6 +740,23 @@ class AttentionEngine:
                 distraction_duration_s = distraction.head_turn_right.duration_s
             elif distraction.primary == "passenger_side":
                 distraction_duration_s = distraction.passenger_side.duration_s
+
+        # PART 8: what a sustained downward head pose means is decided from the
+        # drowsiness state that existed BEFORE the downward pose began (temporal
+        # history), never from the current frame alone.
+        head_down_classification = self.head_down_classifier.update(
+            fatigue_risk=f,
+            distraction=distraction,
+            now_s=now_s,
+            fatigue_status=fatigue_status,
+        )
+
+        # Context urgency (ordering only): environmental axes plus the driver
+        # state (fatigue + distraction together). It speeds an existing
+        # escalation up - it never creates risk or an alert on its own.
+        context_urgency = context_urgency_from(
+            loc, wx, zone, carla_speed_risk, carla_time_risk, f, d
+        )
         raw = fuse_raw_risk(f, d, distraction.primary if distraction is not None else None, distraction_duration_s)
         # Honour configured weights if callers customized them.
         if (
@@ -514,18 +775,31 @@ class AttentionEngine:
         raw = apply_context_boost(
             raw, d, loc, wx, zone, carla_speed_risk, carla_time_risk
         )
+
+        # PART 8 CASE A: drowsiness evidence that was already present BEFORE a
+        # sustained downward head pose makes the combined event drowsiness-grade,
+        # not plain distraction. Bounded (floor + fixed gain); CASE B (no prior
+        # drowsiness) keeps the normal distraction pathway below.
+        if head_down_classification == HEAD_DOWN_DROWSY:
+            raw = max(float(raw) + DROWSY_DOWNWARD_GAIN, DROWSY_DOWNWARD_MIN_RISK)
+
         raw = min(100.0, max(0.0, float(raw)))
 
         smoothed = self._update_smoothed(raw, now_s)
         if smoothed is not None:
             smoothed = min(100.0, max(0.0, float(smoothed)))
         level = risk_level_from_score(smoothed)
-        alert = self._derive_alert_severity(smoothed, level, now_s)
+        alert = self._derive_alert_severity(smoothed, level, now_s, context_urgency)
 
         reason = "Attentive"
         dist_primary = distraction.primary if distraction is not None else "none"
         if smoothed is not None and smoothed > SAFE_MAX:
-            if f >= d and f >= loc and f >= wx:
+            if head_down_classification == HEAD_DOWN_DROWSY:
+                reason = (
+                    "Drowsiness confirmed before a sustained downward posture "
+                    "(very high sleepiness risk)"
+                )
+            elif f >= d and f >= loc and f >= wx:
                 if f >= 70.0:
                     reason = "Prolonged eye closure"
                 elif f >= 45.0:
@@ -534,11 +808,26 @@ class AttentionEngine:
                     reason = "Fatigue risk increasing"
             elif d >= loc and d >= wx and dist_primary != "none":
                 if dist_type == "downward":
-                    reason = "Sustained downward distraction away from the road"
+                    if head_down_classification == HEAD_DOWN_MOBILE_USE:
+                        # Behaviour-based classification: sustained downward
+                        # attention is mobile-use-like. No phone model exists, so
+                        # this never claims the camera detected a phone.
+                        reason = (
+                            "Sustained downward distraction away from the road "
+                            "(mobile-use-like behaviour)"
+                        )
+                    else:
+                        reason = "Sustained downward distraction away from the road"
                 elif dist_type == "passenger_conversation":
                     reason = "Sustained passenger-side distraction away from the road with talking activity"
                 elif dist_type == "head_turn":
-                    reason = "Sustained head-turn distraction away from the road"
+                    side = ""
+                    if head_dir in ("left", "right"):
+                        side = f" {head_dir}"
+                    reason = (
+                        f"Sustained head-turn{side} distraction away from the road "
+                        "— please focus on the road"
+                    )
                 else:
                     reason = "Distraction risk elevated"
             elif loc >= wx and loc >= 40.0:
@@ -588,4 +877,6 @@ class AttentionEngine:
             carla_speed_risk=carla_speed_risk,
             carla_vehicle_state=vehicle_state,
             carla_time_period=time_period,
+            head_down_classification=head_down_classification,
+            pending_escalation=str(self._pending_alert_target or "NONE"),
         )

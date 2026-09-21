@@ -29,17 +29,23 @@ DEMO_ZONE_PRESETS: dict[str, tuple[str, str, float]] = {
     # key -> (display_name, zone_type, risk_level 0..100)
     "normal": ("Normal Road", "none", 5.0),
     "school": ("School Zone", "school", 70.0),
-    "highway": ("Highway", "highway", 40.0),
+    "accident": ("Accident / High-Risk Zone", "accident", 85.0),
     "construction": ("Construction Zone", "construction", 55.0),
+    "pedestrian": ("Pedestrian Zone", "pedestrian", 65.0),
+    "highway": ("Highway", "highway", 40.0),
     "sharp_turn": ("Sharp Turn / High-Risk Zone", "sharp_turn", 65.0),
+    "other": ("Other Road", "other", 25.0),
 }
 
 DEMO_ZONE_LABELS = {
     "normal": "Normal Road",
     "school": "School Zone",
-    "highway": "Highway",
+    "accident": "Accident / High-Risk Zone",
     "construction": "Construction Zone",
+    "pedestrian": "Pedestrian Zone",
+    "highway": "Highway",
     "sharp_turn": "Sharp Turn / High-Risk Zone",
+    "other": "Other Road",
 }
 
 # Default coords used only for DEMO weather lookup (Bangalore).
@@ -107,11 +113,33 @@ class CarlaZone:
 # Projects can replace the bounds for their loaded map without changing the
 # classifier or its Normal Road fallback.
 CARLA_SIM_ZONES: tuple[CarlaZone, ...] = (
-    CarlaZone("School Zone", "school", -120.0, -20.0, -80.0, 20.0, 70.0),
-    CarlaZone("Accident / High-Risk Zone", "accident", 20.0, 120.0, -80.0, -20.0, 85.0),
-    CarlaZone("Construction Zone", "construction", 20.0, 120.0, 20.0, 80.0, 55.0),
-    CarlaZone("Pedestrian Zone", "pedestrian", -120.0, -20.0, 20.0, 80.0, 65.0),
+    CarlaZone("School Zone", "school", -170.0, -35.0, -80.0, 30.0, 70.0),
+    CarlaZone("Accident / High-Risk Zone", "accident", 35.0, 170.0, -105.0, -25.0, 85.0),
+    CarlaZone("Construction Zone", "construction", 40.0, 160.0, 25.0, 95.0, 55.0),
+    CarlaZone("Pedestrian Zone", "pedestrian", -170.0, -35.0, 25.0, 95.0, 65.0),
+    CarlaZone("Highway", "highway", 50.0, 170.0, -170.0, -60.0, 40.0),
+    CarlaZone("Sharp Turn / High-Risk Zone", "sharp_turn", -60.0, 30.0, -170.0, -80.0, 65.0),
+    CarlaZone("Other Road", "other", -200.0, 200.0, -200.0, 200.0, 25.0),
 )
+
+_CANONICAL_ZONE_ALIASES: dict[str, str] = {
+    "school": "school",
+    "school zone": "school",
+    "accident": "accident",
+    "accident zone": "accident",
+    "accident / high-risk zone": "accident",
+    "construction": "construction",
+    "construction zone": "construction",
+    "pedestrian": "pedestrian",
+    "pedestrian zone": "pedestrian",
+    "highway": "highway",
+    "sharp_turn": "sharp_turn",
+    "sharp turn": "sharp_turn",
+    "sharp turn / high-risk zone": "sharp_turn",
+    "other": "other",
+    "normal road": "none",
+    "none": "none",
+}
 
 
 def classify_carla_zone(
@@ -232,7 +260,15 @@ class ZoneTransitionTracker:
     """
 
     NO_ZONE = "none"
-    KNOWN_ZONE_TYPES = ("school", "highway", "construction", "sharp_turn", "other")
+    KNOWN_ZONE_TYPES = (
+        "school",
+        "accident",
+        "construction",
+        "pedestrian",
+        "highway",
+        "sharp_turn",
+        "other",
+    )
 
     def __init__(self) -> None:
         self._zone_type = self.NO_ZONE
@@ -246,7 +282,8 @@ class ZoneTransitionTracker:
     @classmethod
     def classify(cls, zone_type: str | None) -> str:
         value = str(zone_type or "none").strip().lower()
-        return value if value in cls.KNOWN_ZONE_TYPES else cls.NO_ZONE
+        canonical = _CANONICAL_ZONE_ALIASES.get(value, value)
+        return canonical if canonical in cls.KNOWN_ZONE_TYPES else cls.NO_ZONE
 
     def update(self, zone_type, zone_name, now_s: float = 0.0) -> ZoneTransition | None:
         """Observe the current zone; return one ZoneTransition on a boundary."""
@@ -313,9 +350,9 @@ def format_location_summary(ctx: LocationContext) -> str:
     implying the road is verified safe.
     """
     if ctx.mode == "disabled" or ctx.source == "Disabled":
-        return "LOCATION:\nDisabled"
+        return "REAL LOCATION:\nDisabled"
     if not ctx.available:
-        return "LOCATION:\nUnavailable"
+        return "REAL LOCATION:\nUnavailable"
     is_demo = ctx.mode == "demo" or ctx.source == "DEMO"
     src = "DEMO" if is_demo else ctx.source
     in_zone = ctx.zone_type not in ("none", "", "unknown")
@@ -331,7 +368,7 @@ def format_location_summary(ctx: LocationContext) -> str:
         zone = NO_ZONE_NAME
         risk_line = "Location risk: Baseline"
     place = ctx.place_name or ""
-    lines = [f"LOCATION ({src}):", zone, risk_line]
+    lines = [f"REAL LOCATION ({src}):", zone, risk_line]
     if place:
         lines.append(place)
     return "\n".join(lines)

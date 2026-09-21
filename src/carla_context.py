@@ -395,6 +395,7 @@ class CarlaContext:
         self._navigation_method = ""
         self._route_mode = False
         self._last_progress_print_s = 0.0
+        self._last_route_destination: Optional[carla.Location] = None
 
     # ===============================================================
     # CARLA CONNECTION
@@ -869,28 +870,23 @@ class CarlaContext:
     def _weather_demo_parameters(self, index: int) -> Any:
         """Return the CARLA weather preset for one demo scenario."""
 
-        presets = ("ClearNoon", "SoftRainNoon", "HardRainNoon", None, "ClearNoon")
-        if index == 3:
-            return carla.WeatherParameters(
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                70.0,
-                20.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            )
-        preset = getattr(carla.WeatherParameters, presets[index])
+        presets = (
+            "ClearNoon",
+            "SoftRainNoon",
+            "HardRainNight",
+            "FoggyNight",
+            "ClearNight",
+        )
+        if index < 0:
+            index = 0
+        preset_name = presets[index % len(presets)]
+        preset = getattr(carla.WeatherParameters, preset_name, None)
+        if preset is None:
+            return carla.WeatherParameters()
         return preset() if callable(preset) else preset
 
     def update_weather_demo(self, now_s: Optional[float] = None) -> bool:
-        """Advance the five-stage, nonblocking 30-second CARLA weather demo."""
+        """Advance the continuous 30-second weather demo with day/night cycling."""
 
         if self.world is None:
             return False
@@ -900,18 +896,16 @@ class CarlaContext:
             self.weather_demo_started_at = now
 
         elapsed = max(0.0, now - self.weather_demo_started_at)
-        index = min(4, int(elapsed // 30.0))
-        if self.weather_demo_complete and index == self.weather_demo_index:
-            return True
+        index = int(elapsed // 30.0) % 5
         if index == self.weather_demo_index:
             return True
 
         try:
             self.world.set_weather(self._weather_demo_parameters(index))
             self.weather_demo_index = index
-            self.weather_demo_complete = index == 4 and elapsed >= 150.0
-            labels = ("CLEAR", "RAIN", "HEAVY_RAIN", "FOG", "CLEAR")
-            start = index * 30
+            self.weather_demo_complete = False
+            labels = ("CLEAR DAY", "RAIN DAY", "HEAVY RAIN NIGHT", "FOG NIGHT", "CLEAR NIGHT")
+            start = (index * 30)
             end = start + 30
             print(f"CARLA weather demo -> {labels[index]} ({start}-{end}s)")
             return True
@@ -1251,8 +1245,9 @@ class CarlaContext:
     ) -> Optional[Any]:
         """Pick the most natural forward driving branch from CARLA topology.
 
-        Prefer straight continuation (smallest heading change). Visited state is
-        only a tie-breaker to avoid loops, never to force exploration detours.
+        Prefer a branch that leaves the current road and avoids previously visited
+        lane segments. Within the same road, keep the least-angle continuation as
+        the natural default.
         """
 
         if waypoint is None:
@@ -1264,14 +1259,17 @@ class CarlaContext:
         if not candidates:
             return None
 
-        scored: list[tuple[tuple[float, int], Any]] = []
+        current_road_id = int(getattr(waypoint, "road_id", 0))
+        scored: list[tuple[tuple[int, int, float], Any]] = []
         for candidate, angle_delta in candidates:
+            candidate_road_id = int(getattr(candidate, "road_id", 0))
             was_visited = (
                 self._waypoint_fingerprint(candidate) in self._visited_waypoints
             )
+            road_bias = 0 if candidate_road_id != current_road_id else 1
             scored.append(
                 (
-                    (angle_delta, 1 if was_visited else 0),
+                    (road_bias, 1 if was_visited else 0, angle_delta),
                     candidate,
                 )
             )
@@ -1905,7 +1903,11 @@ class CarlaContext:
         return True
 
     def _tick_route_follower(self) -> bool:
-        """Advance official route navigation by one control step."""
+        """Advance official route navigation by one control step.
+
+        Reaching a destination does not end the demo loop; instead, it chooses a
+        new validated route and keeps driving until Ctrl+C.
+        """
 
         if not self.route_active or self.route_agent is None:
             return False
@@ -1922,9 +1924,14 @@ class CarlaContext:
                 self.route_active = False
                 self.route_completed = True
                 self._route_mode = False
+                self.route_agent = None
                 print("Destination reached.")
-                print("Route completed successfully.")
-                print("Vehicle stopped safely.")
+                print("Selecting a new validated route...")
+                if self.start_route_following():
+                    print("Continuing drive on the next route.")
+                    return True
+                print("No valid next route available. Stopping vehicle.")
+                self.stop_vehicle()
                 return False
 
             control = self.route_agent.run_step()
