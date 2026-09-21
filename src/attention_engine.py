@@ -447,17 +447,37 @@ class AttentionEngine:
         carla = carla_context or {}
         carla_weather = carla.get("weather") or {}
         carla_time = carla.get("time") or {}
+        carla_location = carla.get("location") or {}
         carla_speed_kmh = max(0.0, float(carla.get("speed_kmh") or 0.0))
         carla_speed_risk = max(0.0, min(100.0, float(carla.get("speed_risk") or 0.0)))
         carla_time_risk = max(0.0, min(100.0, float(carla_time.get("risk") or 0.0)))
-        if carla.get("carla_connected"):
-            wx = max(wx, float(carla_weather.get("risk") or 0.0))
-            if weather_condition in ("", "unknown"):
-                weather_condition = str(carla_weather.get("condition") or "unknown")
-        vehicle_state = str(carla.get("vehicle_state") or "UNAVAILABLE")
-        time_period = str(carla_time.get("period") or "UNKNOWN")
+        # Initialise zone and weather_condition from the caller-supplied values,
+        # then let CARLA simulated values take precedence when the simulator is
+        # connected (CARLA simulated context is the ground truth in simulation).
         zone = str(location_zone or "none")
         wx_cond = str(weather_condition or "unknown")
+        if carla.get("carla_connected"):
+            carla_weather_risk = float(carla_weather.get("risk") or 0.0)
+            if carla_weather_risk > 0.0:
+                wx = max(wx, carla_weather_risk)
+            # In CARLA simulation, the simulator's weather is the ground truth —
+            # real-world API weather is irrelevant, so CARLA condition takes full
+            # precedence when the simulator is connected.
+            carla_cond = str(carla_weather.get("condition") or "unknown")
+            if carla_cond and carla_cond != "unknown":
+                wx_cond = carla_cond
+            # CARLA simulated location replaces GPS-derived values when connected.
+            carla_loc_risk = float(carla_location.get("risk_level") or 0.0)
+            if carla_loc_risk > 0.0:
+                loc = carla_loc_risk
+            carla_zone = str(carla_location.get("zone_type") or "none")
+            if carla_zone and carla_zone != "none":
+                zone = carla_zone
+            elif carla_zone == "none":
+                # CARLA says "none" — use that, don't invent a zone from zone_name.
+                zone = "none"
+        vehicle_state = str(carla.get("vehicle_state") or "UNAVAILABLE")
+        time_period = str(carla_time.get("period") or "UNKNOWN")
         context_urgency = context_urgency_from(
             loc, wx, zone, carla_speed_risk, carla_time_risk
         )

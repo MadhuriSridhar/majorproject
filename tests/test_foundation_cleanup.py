@@ -8,11 +8,42 @@ safety, alert duration configuration, and audio ordering.
 from __future__ import annotations
 
 import sys
+import types
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+if "carla" not in sys.modules:
+    fake_carla = types.ModuleType("carla")
+
+    class _LaneType:
+        Driving = "driving"
+
+    class _VehicleControl:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class _Location:
+        def __init__(self, x=0.0, y=0.0, z=0.0):
+            self.x = x
+            self.y = y
+            self.z = z
+
+    class _Transform:
+        def __init__(self, location=None, rotation=None):
+            self.location = location or _Location()
+            self.rotation = rotation or types.SimpleNamespace(yaw=0.0)
+
+    fake_carla.LaneType = _LaneType
+    fake_carla.VehicleControl = _VehicleControl
+    fake_carla.Location = _Location
+    fake_carla.Transform = _Transform
+    fake_carla.Vehicle = object
+    fake_carla.Client = object
+    fake_carla.World = object
+    sys.modules["carla"] = fake_carla
 
 from alert_escalation import AlertEscalationController  # noqa: E402
 from app_ui import format_carla_context, resolve_driver_state, should_run_analysis  # noqa: E402
@@ -35,6 +66,70 @@ from temporal_mouth import YawnTracker  # noqa: E402
 
 def E(**kwargs) -> FatigueEvidence:
     return FatigueEvidence(**kwargs)
+
+
+class CarlaRouteSelectionTests(unittest.TestCase):
+    def test_route_selection_prefers_unvisited_driving_branch(self) -> None:
+        from carla_context import CarlaContext  # noqa: E402
+
+        context = CarlaContext.__new__(CarlaContext)
+        context._visited_waypoints = {
+            (10, 1, 0, 0.0),
+            (10, 1, 0, 8.0),
+            (11, 0, 0, 0.0),
+        }
+        context._recent_waypoints = []
+
+        current = types.SimpleNamespace(
+            road_id=10,
+            section_id=1,
+            lane_id=0,
+            s=6.0,
+            lane_type="driving",
+            transform=types.SimpleNamespace(
+                location=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                rotation=types.SimpleNamespace(yaw=0.0),
+            ),
+        )
+        straight = types.SimpleNamespace(
+            road_id=10,
+            section_id=1,
+            lane_id=0,
+            s=14.0,
+            lane_type="driving",
+            transform=types.SimpleNamespace(
+                location=types.SimpleNamespace(x=0.0, y=20.0, z=0.0),
+                rotation=types.SimpleNamespace(yaw=0.0),
+            ),
+        )
+        left = types.SimpleNamespace(
+            road_id=11,
+            section_id=0,
+            lane_id=0,
+            s=2.0,
+            lane_type="driving",
+            transform=types.SimpleNamespace(
+                location=types.SimpleNamespace(x=1.0, y=5.0, z=0.0),
+                rotation=types.SimpleNamespace(yaw=90.0),
+            ),
+        )
+        right = types.SimpleNamespace(
+            road_id=12,
+            section_id=0,
+            lane_id=0,
+            s=2.0,
+            lane_type="driving",
+            transform=types.SimpleNamespace(
+                location=types.SimpleNamespace(x=-2.0, y=5.0, z=0.0),
+                rotation=types.SimpleNamespace(yaw=-90.0),
+            ),
+        )
+        current.next = lambda distance: [straight, left, right]
+
+        target = context._select_target_waypoint(current)
+        self.assertIsNotNone(target)
+        self.assertNotEqual(target.road_id, 10)
+        self.assertIn(target.road_id, (11, 12))
 
 
 class CarlaContextDisplayTests(unittest.TestCase):
