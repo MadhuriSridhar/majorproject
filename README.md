@@ -1,740 +1,492 @@
-# Driver Drowsiness Prediction and Prevention System
+# Neuro-Symbolic Driver Attention Monitoring System
 
 ## 1. Project Overview
 
-A **real-time**, **laptop-webcam**, **computer-vision**, **rule-based** driver
-drowsiness prediction and prevention prototype.
+This repository contains a real-time driver attention and alertness monitoring
+prototype. It reads a laptop webcam with OpenCV, detects facial landmarks with
+the MediaPipe Face Landmarker model, extracts eye and mouth measurements, and
+uses deterministic, explainable rules to estimate fatigue and distraction.
 
-The system estimates driver fatigue risk from facial behaviour (eye closure,
-blinks, yawns) plus contextual factors (night, driving duration), and warns the
-driver with progressive audio and visual alerts before risk becomes severe.
+The system combines:
 
-> **Safety / honesty:** This is a final-year BE CSE prototype, **not** a
-> certified automotive safety system. Thresholds and weights are engineering
-> defaults tuned on a laptop webcam. There is **no** formal labelled-dataset
-> accuracy study, and no scientific accuracy percentage should be claimed in a
-> viva.
+- facial and visual cues such as eye closure, blinks, yawns, head turns, and
+  downward gaze;
+- fatigue and visual-distraction risk;
+- contextual risk from time, driving duration, location/zone, weather, and
+  (when CARLA is connected) simulated speed, location, weather, and
+  day/night state;
+- progressive alarm, voice, and dashboard notifications.
 
----
+CARLA integration is implemented as a simulator context provider and as a
+standalone route/weather demo. The normal dashboard attempts to use CARLA on
+`localhost:2000` when it is available, but it can also run with webcam and
+non-CARLA context.
 
-## 2. Objectives
+This is a final-year engineering prototype, not a certified automotive safety
+system. Dataset-based accuracy validation and real-vehicle deployment are not
+currently complete.
 
-The project implements:
+## 2. Features
 
-- Real-time facial monitoring from a laptop webcam
-- Eye aspect ratio (EAR) and eye open/closed classification
-- Blink detection and blink-rate estimation
-- Mouth aspect ratio (MAR) and yawn detection
-- Prolonged eye-closure detection
-- Night context (10:00 PM – 6:00 AM, local time)
-- Driving-duration context (real threshold: 3 hours)
-- Rule-based fatigue risk scoring (0–100)
-- Progressive alert escalation (NORMAL → LOW FATIGUE → ALERT → WARNING → DROWSY)
-- Session monitoring (metrics, risk history)
-- Session summary with risk-factor breakdown
-- Local PDF export of the session summary
+### Implemented
 
----
+- OpenCV webcam capture and live Tkinter dashboard.
+- MediaPipe Face Landmarker facial landmark detection.
+- Eye Aspect Ratio (EAR) analysis.
+- Blink detection, blink-rate tracking, and temporal eye-closure analysis.
+- Prolonged eye-closure detection.
+- Mouth Aspect Ratio (MAR) analysis and temporal yawning detection.
+- Head-pose estimation and visual distraction classification, including head
+  turns and sustained downward gaze. A downward gaze is a behaviour-based
+  distraction signal; the system does not claim to detect a phone.
+- Rule-based fatigue risk estimation and combined attention/alertness scoring.
+- Context-aware risk fusion for fatigue, distraction, location, weather,
+  simulated speed, time, and configured CARLA zones.
+- Explainable risk factors, reasons, severity bands, risk trend, and session
+  statistics.
+- Alert escalation through `NORMAL`, `LOW_FATIGUE`, `ALERT`, `WARNING`, and
+  `DROWSY`.
+- Predefined WAV alarm tones and `pyttsx3` voice notification.
+- Priority interruption, persistence, hysteresis, cooldowns, and recovery
+  behaviour.
+- Safe handling of no-face and multiple-face frames: analysis pauses instead
+  of reusing stale facial measurements.
+- Dashboard settings, persisted dashboard preferences, session summary, and
+  local PDF export.
+- Location context using Windows geolocation when available, IP fallback, and
+  cache. Configurable geofences are supported; the checked-in
+  `config/geofences.json` is empty.
+- Weather context using Open-Meteo with throttling, cache, and failure-safe
+  fallback.
+- CARLA context integration:
+  - vehicle lookup or generic vehicle spawn;
+  - vehicle speed and speed-risk context;
+  - CARLA world location/zone context;
+  - CARLA weather context;
+  - simulated day/night context from sun altitude;
+  - smooth spectator-camera following;
+  - official CARLA `GlobalRoutePlanner` plus `BasicAgent` route navigation;
+  - five-preset weather/day-night demo.
 
-## 3. Current Scope
+### Not currently implemented
 
-The following are **implemented** in this repository:
+- Traffic simulation as a project feature.
+- Mobile-phone or hand-object detection.
+- Speech, passenger-talking, sunglasses, or eye-occlusion detection.
+- Low-light enhancement or night vision.
+- CAN, OBD-II, ignition, vehicle-motion sensors, or real-vehicle control.
+- A machine-learning fatigue classifier beyond the MediaPipe landmark model.
 
-- Laptop webcam capture (OpenCV)
-- MediaPipe Face Landmarker (`.task` model)
-- EAR (eye aspect ratio)
-- Blink detection / blink count
-- Blink rate
-- Eye closure tracking / prolonged eye closure
-- MAR (mouth aspect ratio)
-- Yawn detection / yawn count
-- Yawn frequency
-- Night context
-- Driving-duration context
-- Rule-based fatigue engine
-- Risk score (0–100)
-- Temporal smoothing, persistence, hysteresis, recovery
-- Progressive alert escalation (5 levels: NORMAL, LOW FATIGUE, ALERT, WARNING, DROWSY)
-- pyttsx3 voice alerts
-- Predefined local alarm sounds
-- Alert priority interruption (higher severity cuts in; lower never blocks higher)
-- Settings (volumes, voice, visual alerts, predefined sound selection)
-- Dashboard customization (persisted locally)
-- Risk trend / table breakdown
-- Session statistics
-- Session summary
-- PDF export
-- Driver distraction monitoring (head turn, looking down, passenger-side /
-  lateral-attention proxy) — head pose from the existing face landmarks
-- Attention engine (fuses fatigue + distraction + location + weather context)
-- Location context (GPS → IP fallback → cache; demo zones; configurable
-  geofences for real high-risk-zone classification)
-- Weather context (Open-Meteo, cached + failure-safe; precipitation,
-  visibility, wind, rain probability)
-- Context-aware alert severity (environment amplifies existing driver risk)
-- Automated tests (deterministic, no webcam required)
-
----
-
-## 4. Explicitly Out of Scope (NOT implemented)
-
-The following are **not** part of this project and must not be implied as
-implemented:
-
-- Machine learning classifier
-- Firebase / cloud storage
-- Driver login
-- Sunglasses detection
-- Eye-occlusion detection
-- Low-light enhancement / night vision
-- Mobile-phone / hand-object detection (no phone/hand model is bundled)
-- Dashboard / knob interaction detection
-- Actual speech / passenger-talking detection (lateral head turn is only a
-  distraction *proxy*, not speech detection)
-- IR camera
-- CAN
-- OBD-II
-- Vehicle motion detection
-- Ignition detection
-- Raspberry Pi
-- External automotive hardware
-
----
-
-## 5. System Architecture
+## 3. System Architecture
 
 ```text
-Laptop Webcam
-     |
-     v
-OpenCV (VideoCapture)
-     |
-     v
-MediaPipe Face Landmarker  <--- models/face_landmarker.task
-     |
-     v
-EAR / MAR  (eye_features.py, mouth_features.py)
-     |
-     v
-Temporal Eye / Mouth Analysis  (temporal_eye.py, temporal_mouth.py)
-     |
-     v
-Context Analysis  (time_context.py, driving_duration.py)
-     |
-     v
-Evidence Bridge  (evidence_bridge.py)
-     |
-     v
-Fatigue Engine  (fatigue_engine.py)  <--- authoritative fatigue decision-maker
-     |
-     v
-Head Pose / Distraction  (head_pose.py, distraction_monitor.py)
-     |
-     v
-Location / Weather Context  (location_context.py, weather_context.py)
-     |
-     v
-Attention Engine  (attention_engine.py)  <--- fuses all signals
-     |
-     v
-AttentionDecision (combined risk, level, alert severity, reasons)
-     |
-     v
-Alert Controller  (alert_escalation.py -> audio_engine.py)
-     |
-     v
-UI / Audio / Session Summary
+Webcam
+  |
+  v
+Face Detection / MediaPipe Face Landmarks
+  |
+  v
+Feature Extraction (EAR, MAR, blink, yawn, head pose)
+  |
+  v
+Fatigue Analysis + Visual Distraction Analysis
+  |                         ^
+  |                         |
+  +------------ CARLA context (zone, weather, day/night, speed)
+  |                         |
+  v                         |
+Attention Engine <----------+
+  |
+  v
+Alert Escalation Controller
+  |
+  v
+Alarm / pyttsx3 Voice / Tkinter Dashboard
 ```
 
-**Authoritative decision-makers:** `FatigueEngine` computes the fatigue risk
-score, factor breakdown, and reasons; `AttentionEngine` fuses fatigue,
-distraction, location, and weather context into the combined attention risk and
-the alert severity that actually drives escalation. The UI, alert system, and
-session summary only *display* those values — none of them re-implement
-scoring or connect individual sensors directly to audio.
+`FatigueEngine` owns fatigue scoring. `AttentionEngine` fuses fatigue,
+distraction, and context. `AlertEscalationController` owns alert state and
+timing. The UI displays those outputs rather than recalculating risk.
 
-**One authoritative alert path:** `AlertEscalationController` + `AudioEngine`
-handle all alerts. Audio triggers once per severity state entry (never every
-frame) and supports priority interruption.
+## 4. Technology Stack
 
----
+The versions below are the constraints declared by `requirements.txt`; exact
+installed patch versions may differ.
 
-## 6. Fatigue Features
+| Technology | Use | Declared version |
+|---|---|---|
+| Python | Runtime | Python 3.12.3 in the checked-in `.venv`; Python 3.12 is the verified runtime |
+| OpenCV (`opencv-contrib-python`) | Camera frames and image processing | `>=4.10.0,<5.0.0` |
+| MediaPipe | Face Landmarker Tasks API | `>=0.10.14,<2.0.0` |
+| NumPy | Landmark and numeric feature calculations | Installed transitively/with OpenCV and MediaPipe; not pinned directly |
+| Pillow | Tkinter camera-image rendering | `>=10.0.0` |
+| Tkinter/`ttk` | Dashboard and settings UI | Python standard-library GUI |
+| `pyttsx3` | Offline text-to-speech voice alerts | `>=2.90` |
+| Windows `winsound` | Interruptible WAV alarm playback | Python/Windows standard library |
+| ReportLab | Session-summary PDF export | `>=4.0.0` |
+| CARLA Python API | CARLA client and simulator types | Required by `src/carla_context.py`; not pinned in `requirements.txt` |
+| CARLA Python agents | `GlobalRoutePlanner`, `BasicAgent`, `RoadOption` | Supplied by the CARLA PythonAPI |
+| Open-Meteo | Weather context HTTP endpoint | No Python package; standard-library `urllib` client |
 
-### Eyes — EAR
+CARLA navigation may also require the dependencies shipped with the CARLA
+PythonAPI, including `networkx` and `Shapely`, as reported by the loader when
+agent imports fail.
 
-- `eye_features.py` computes left/right/average **EAR** from six landmark
-  points per eye.
-- `temporal_eye.py` turns the per-frame EAR into temporal **blink** vs
-  **prolonged closure** events.
+## 5. System Requirements
 
-### Mouth — MAR
+- Windows is the supported and verified operating system. The audio backend
+  uses Windows `winsound`.
+- Python 3.12 is verified in the repository virtual environment.
+- A webcam accessible by OpenCV is required for the live dashboard.
+- The MediaPipe model file `models/face_landmarker.task` is required.
+- CARLA is required only for CARLA demos or CARLA context. The repository does
+  not pin a CARLA release; use a CARLA installation whose PythonAPI matches
+  the installed client package.
+- A normal desktop CPU is sufficient for the rule-based processing, but no
+  formal CPU, GPU, or RAM minimum has been established in this repository.
+- Internet access is optional for the core webcam pipeline. It is used for
+  IP geolocation fallback and Open-Meteo weather; cached or unavailable
+  context is handled without stopping the camera loop.
+- Disk space is needed for Python dependencies, the MediaPipe `.task` model,
+  and optional generated reports/audio assets.
 
-- `mouth_features.py` computes **MAR** from lip landmarks.
-- `temporal_mouth.py` turns the per-frame MAR into **yawn** events.
-
-### Temporal behaviour (why a single frame is not enough)
-
-- **One blink** is a short, re-opening eye closure → very low / no fatigue risk.
-- **Brief mouth opening** is not a yawn — the mouth must stay open long enough.
-- **Prolonged eye closure** is treated as a **strong** direct fatigue indicator.
-
-| Parameter | Value |
-|-----------|-------|
-| EAR close threshold | 0.21 |
-| EAR open (hysteresis) | 0.23 |
-| Blink min / max | 0.10 / 0.80 s |
-| Prolonged eye closure | ≥ 1.50 s |
-| MAR open threshold | 0.60 |
-| MAR close (hysteresis) | 0.52 |
-| Yawn minimum duration | 1.20 s |
-
----
-
-## 7. Fatigue Risk Engine
-
-The system is **rule-based** — no machine learning.
-
-- Risk score ranges **0–100** (clamped).
-- Risk factors: **Eye**, **Blink**, **Yawn**, **Night**, **Driving Duration**.
-- **Prolonged eye closure** is the strongest direct signal and can independently
-  reach DROWSY.
-- **Yawn** and **blink behaviour** are supporting signals.
-- **Night** and **driving duration** are contextual signals.
-- Context alone (night and/or duration) cannot automatically produce DROWSY.
-
-| Weight / threshold | Value |
-|--------------------|-------|
-| Prolonged eye closure | +70 |
-| Yawn event | +15 (bounded, max 15) |
-| Night context | +5 |
-| Driving duration risk | +10 (max) |
-| LOW FATIGUE entry | 25 |
-| ALERT entry | 35 |
-| WARNING entry | 50 |
-| DROWSY entry | 70 |
-| Smoothing alpha | 0.35 |
-
-Severity mapping (using the authoritative risk score 0–100):
-
-| Range | Severity |
-|-------|----------|
-| 0–19 | NORMAL |
-| 20–34 | LOW FATIGUE |
-| 35–49 | ALERT |
-| 50–69 | WARNING |
-| 70–100 | DROWSY |
-
-Persistence, hysteresis, smoothing, and recovery protect against flicker and
-false alarms. A genuine prolonged eye closure (a strong direct signal) can reach
-DROWSY on its own; night and driving duration alone never do.
-
----
-
-## 8. Driving Duration
-
-- **Real project threshold: 3 hours** (`DRIVING_DURATION_THRESHOLD_HOURS = 3.0`).
-- The contribution is **gradual and contextual**: negligible before 3 hours,
-  starts after 3 hours, higher after 4 hours, and max at 5+ hours.
-- **Driving duration alone never triggers DROWSY.**
-
-### Demo mode (testing only)
-
-- `USE_DEMO_DRIVING_DURATION = True` uses a **30-second** shortcut threshold so
-  the logic can be verified without waiting 3 hours.
-- The UI shows **DEMO MODE** when this is active.
-- The 30-second value is a **demonstration shortcut only**. Never present
-  "30 seconds of driving" as the real fatigue threshold.
-
----
-
-## 9. Night Context
-
-- Active window: **10:00 PM – 6:00 AM** (`NIGHT_START = time(22,0,0)`,
-  `NIGHT_END = time(6,0,0)`).
-- Uses the computer's **local system time**.
-- Night is a **contextual factor only**; night alone cannot trigger DROWSY.
-- There is **no** low-light enhancement or night-vision processing — the camera
-  operates normally.
-
----
-
-## 10. Alert Escalation
-
-Alert levels and priority:
-
-```text
-NORMAL
-  ↓
-LOW FATIGUE
-  ↓
-ALERT
-  ↓
-WARNING
-  ↓
-DROWSY
-```
-
-Priority: DROWSY > WARNING > ALERT > LOW FATIGUE > NORMAL.
-
-| Level | Alarm | Duration | Voice message |
-|-------|-------|----------|---------------|
-| LOW FATIGUE | voice only (no alarm) | — | "Please stay alert." |
-| ALERT | soft beep | ~3 s | "Please stay attentive." |
-| WARNING | warning alarm | ~7 s | "Fatigue warning. Please stay alert." |
-| DROWSY | strong alarm | ~10 s | "Driver fatigue detected. Please take a safe break." |
-
-Alert rules:
-
-- Audio triggers **on state entry** (once) and does **not** repeat every frame.
-- **Sound finishes before voice** — they never overlap.
-- **Higher severity interrupts lower severity**: e.g. ALERT audio is stopped
-  when WARNING arrives; the ALERT voice is then *not* spoken.
-- **Lower severity never interrupts higher severity**: e.g. WARNING cannot
-  interrupt DROWSY.
-- **Recovery resets alert eligibility** so a later episode can alert again.
-- **Audio failures never crash** the app — detection and UI continue.
-
----
-
-## 11. Audio Settings
-
-The **Settings** screen controls playback:
-
-- **Alert Volume** — controls the LOW FATIGUE / ALERT alarm and the voice volume.
-- **Alarm Volume** — controls the WARNING and DROWSY alarm volume.
-- **Voice alerts** — enable/disable pyttsx3 voice.
-- **Visual alerts** — enable/disable on-screen alert overlays.
-- **Alarm sounds** — enable/disable the alarm tones.
-- **Predefined sound selection** — choose from bundled local alarm sounds.
-
-Volume scaling is applied to the PCM samples at runtime; the original
-`assets/sounds/*.wav` files are **never modified**. Only predefined local alarm
-sounds are used — users cannot import custom music files.
-
----
-
-## 12. No Face / Multiple Face Safety
-
-- **No face detected:** the dashboard shows **FACE NOT DETECTED**, facial
-  fatigue calculations pause, and no stale EAR/MAR/blink/yawn values are reused.
-  No fatigue alert is generated from missing facial data.
-- **Multiple faces:** the dashboard shows **MULTIPLE FACES DETECTED**, driver
-  analysis pauses, and the system does **not** arbitrarily choose one face.
-- When a single valid face returns, analysis resumes safely.
-
----
-
-## 13. User Interface
-
-The dashboard (`src/app_ui.py`) is a professional Tkinter application.
-
-- **Start Driving screen:** camera preview + START DRIVING button.
-- **Top bar:** Driver Drowsiness Monitor, current time, camera status, Settings.
-- **Main dashboard:** live camera with facial landmarks, fatigue risk,
-  driver metrics, driving session, STOP DRIVING.
-- **Driver metrics:** blinks, blink rate, yawns, yawn frequency, eye status,
-  eye closure, fatigue risk, status.
-- **Risk:** TREND and TABLE risk-factor breakdown (Eye, Blink, Yawn, Night,
-  Driving Duration), plus combined attention risk, distraction risk, location
-  and weather context.
-- **Context:** current time, night context, driving duration, location (GPS/IP/
-  demo/geofence) and weather.
-- **Bottom bar:** FPS, camera/system state.
-- **Session summary:** after STOP DRIVING (EXPORT PDF / NEW DRIVING SESSION /
-  EXIT).
-
----
-
-## 14. Settings
-
-The Settings screen includes only supported options:
-
-- Alert volume (independent of Alarm volume)
-- Alarm volume (independent of Alert volume)
-- Voice alerts (pyttsx3)
-- Visual alerts
-- Alarm sounds (enable/disable)
-- Predefined alarm selection (ALERT / WARNING / DROWSY)
-- Distraction monitoring (enable/disable)
-- Location risk (enable/disable)
-- Location mode (GPS / Automatic, Demo, Disabled)
-- Demo zone (for demo mode)
-- Weather monitoring (enable/disable)
-- Dashboard customization
-
-**Dashboard customization** lists only implemented components:
-
-- Fatigue Risk
-- Eye Monitoring
-- Blink Count
-- Blink Rate
-- Yawn Count
-- Yawn Frequency
-- Eye Closure
-- Driving Duration
-- Current Time
-- Night Context
-- Location / GPS
-- Weather
-- Camera FPS
-- Camera Status
-
-Preferences are persisted locally (JSON).
-
----
-
-## 15. Session Summary
-
-After **STOP DRIVING**, the session summary shows:
-
-- Driving duration
-- Average fatigue risk
-- Maximum fatigue risk
-- Total blinks / average blink rate
-- Total yawns
-- Low fatigue / warning / drowsy event counts
-- Risk-factor breakdown (Eye, Blink, Yawn, Night, Driving Duration)
-- Final status
-- Night context
-
-**PDF export** (ReportLab) writes a local report to `reports/` and includes the
-session ID, date, start/end times, driving duration, risk statistics, event
-counts, risk-factor breakdown, and a sampled risk trend.
-
----
-
-## 15a. Location / Weather Context
-
-- **Location flow:** Windows geolocation → IP fallback → cached coordinates.
-  A network/GPS failure never crashes the app and never blocks the camera loop
-  (context is fetched in a background worker).
-- **Location modes:** `GPS / Automatic`, `Demo` (controlled demo zones), and
-  `Disabled`. Demo zones are clearly labelled `DEMO`.
-- **Real high-risk zones:** configurable geofences in `config/geofences.json`
-  (latitude, longitude, radius, zone type, name, risk level). The dataset is
-  empty by default — the app never presents arbitrary coordinates as real
-  safety zones. See `config/geofences.example.json` for the schema.
-- **Populating the geofence file (OpenStreetMap / Overpass):** run
-  `python tools/build_geofences.py --south ... --west ... --north ... --east ...`
-  to copy already-mapped OpenStreetMap features into `config/geofences.json`
-  for a bounding box you choose. Default categories: `school` (school /
-  kindergarten / college / university) and `construction` (landuse/highway =
-  construction). `sharp_turn` / `highway` zones are **not** auto-generated
-  (OSM does not expose road-curve geometry as simple point features) — add such
-  zones manually with coordinates you verify. The script only copies mapped
-  data; it never invents zones.
-- **Empty geofence file = honest baseline.** With `config/geofences.json` empty
-  (or no matching zone), the UI shows **"No configured high-risk zone"** and
-  **"Location risk: Baseline"** — never a "verified safe road" claim.
-- **Zone entry/exit is an event, not a repeated message.** Remaining inside a
-  zone is one episode; the system emits a single entry event and a single exit
-  event (`ZoneTransitionTracker`), shown as a compact line in the UI and counted
-  in the session summary.
-- **Weather:** Open-Meteo (no API key), throttled and cached, with a safe
-  neutral fallback when unavailable. Precipitation, visibility, wind, and rain
-  probability are mapped to an environmental risk.
-- **Context is amplifying, not decisive:** location/weather *amplify* existing
-  driver risk. An attentive driver with clear weather stays low risk.
-
----
-
-## 16. Project Structure
+## 6. Project Structure
 
 ```text
 majorproject/
-├── .gitignore
-├── README.md
-├── DEMO.md
-├── requirements.txt
-├── models/
-│   └── face_landmarker.task        # MediaPipe model (required)
-├── assets/
-│   └── sounds/                     # generated predefined WAVs (git-ignored)
-├── config/
-│   ├── geofences.json              # optional real-world geofence dataset (empty)
-│   └── geofences.example.json      # documented example (placeholder coords)
 ├── src/
-│   ├── app_ui.py                   # Tkinter dashboard (main application entry)
-│   ├── drowsiness_demo.py          # OpenCV webcam monitor (alert escalation)
-│   ├── facial_landmarks.py         # MediaPipe Face Landmarker helpers
-│   ├── eye_features.py             # EAR math
-│   ├── temporal_eye.py             # Blink / prolonged closure tracker
-│   ├── mouth_features.py           # MAR math
-│   ├── temporal_mouth.py           # Yawn tracker
-│   ├── head_pose.py                # head-pose estimation from face landmarks
-│   ├── distraction_monitor.py      # head-turn / look-down / passenger-side proxy
-│   ├── attention_engine.py         # fuses fatigue + distraction + context
-│   ├── time_context.py             # DAY / NIGHT context
-│   ├── driving_duration.py         # session timer + duration risk
-│   ├── evidence_bridge.py          # maps trackers/context -> FatigueEvidence
-│   ├── fatigue_engine.py           # authoritative rule-based fatigue engine
-│   ├── location_context.py         # GPS/IP/cache/demo/geofence location context
-│   ├── weather_context.py          # Open-Meteo weather context (cached)
-│   ├── alert_escalation.py         # 5-level alert state machine
-│   ├── audio_engine.py             # interruptible sound -> voice playback
-│   ├── predefined_sounds.py        # local sound synthesis + durations
-│   ├── session_manager.py          # session stats / history / counters
-│   ├── session_summary.py          # summary text + PDF export
-│   ├── settings_store.py           # settings + dashboard preferences
-│   └── stage demos                 # webcam_test, landmark_demo, ear_demo,
-│                                   # blink_demo, yawn_demo, context_demo
-└── tests/
-    ├── test_alert_escalation.py
-    ├── test_alert_level.py         # 5-level alert system (ALERT severity)
-    ├── test_alert_stability.py     # warning persistence / ALERT hysteresis / gap
-    ├── test_attention_alerts.py
-    ├── test_attention_distraction.py
-    ├── test_audio_engine.py
-    ├── test_audio_priority.py      # audio interruption / independent volume
-    ├── test_context_aware_risk.py
-    ├── test_dashboard_prefs.py
-    ├── test_driving_duration.py
-    ├── test_evidence_bridge.py
-    ├── test_fatigue_engine.py
-    ├── test_foundation_cleanup.py
-    ├── test_foundation_engine.py
-    ├── test_location_context.py
-    ├── test_session_manager.py
-    ├── test_session_summary.py
-    ├── test_temporal_eye.py
-    ├── test_temporal_mouth.py
-    ├── test_time_context.py
-    └── test_weather_context.py
+│   ├── app_ui.py              # Main Tkinter dashboard entry point
+│   ├── carla_context.py       # CARLA client, context, route and weather demo
+│   ├── facial_landmarks.py    # MediaPipe Face Landmarker wrapper
+│   ├── eye_features.py        # EAR and eye feature extraction
+│   ├── temporal_eye.py        # Blink and prolonged-closure tracking
+│   ├── mouth_features.py      # MAR and mouth feature extraction
+│   ├── temporal_mouth.py      # Yawn tracking
+│   ├── head_pose.py           # Head-pose estimation
+│   ├── distraction_monitor.py # Visual distraction state
+│   ├── fatigue_engine.py      # Authoritative fatigue score
+│   ├── attention_engine.py    # Fatigue/distraction/context fusion
+│   ├── alert_escalation.py    # Alert state machine and cooldowns
+│   ├── audio_engine.py        # WAV playback and voice alerts
+│   ├── location_context.py    # GPS/IP/cache/geofence context
+│   ├── weather_context.py     # Open-Meteo context
+│   ├── session_manager.py     # Session metrics and events
+│   └── session_summary.py     # Summary and PDF export
+├── tests/                     # Deterministic unit tests
+├── config/
+│   ├── geofences.json         # Current configured geofences (empty)
+│   ├── geofences.example.json # Geofence schema example
+│   └── *cache.json            # Location/weather caches
+├── models/face_landmarker.task # Required MediaPipe model
+├── assets/sounds/             # Local alarm WAV assets
+├── requirements.txt           # Python dependency constraints
+├── settings.json              # Persisted audio/settings values
+└── dashboard_prefs.json       # Persisted dashboard component selection
 ```
 
----
+## 7. Environment Setup
 
-## 17. Installation
-
-### Requirements
-
-- Windows 10/11
-- Python 3.12 recommended
-- Working webcam (camera privacy permission enabled)
-- Speakers/headphones for audio alerts
-- MediaPipe `.task` model at `models/face_landmarker.task`
-
-### Setup
+From the repository root, create and activate the existing Windows
+PowerShell virtual environment:
 
 ```powershell
-cd C:\Users\samud\Desktop\MAJOR_PROJECT\majorproj
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
 ```
 
-Confirm the model file exists:
+Install the declared dependencies:
 
 ```powershell
-dir models\face_landmarker.task
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-If missing, download the official MediaPipe Face Landmarker `.task` model and
-save it as `models/face_landmarker.task` (URL is documented in
-`facial_landmarks.py`).
+The current repository already includes `models/face_landmarker.task`. If that
+file is absent in another checkout, download Google's Face Landmarker task
+model from the URL in `src/facial_landmarks.py` and save it at exactly
+`models/face_landmarker.task`.
 
-`requirements.txt`:
+CARLA is not installed by `requirements.txt`. Install CARLA separately and
+make its Python client importable in the virtual environment. The project
+automatically searches the standard `C:\CARLA\PythonAPI\carla` layout and
+other local Python paths; manually setting `CARLA_ROOT` or `PYTHONPATH` is not
+required for the normal setup.
 
-```text
-opencv-contrib-python>=4.10.0,<5.0.0
-mediapipe>=0.10.14,<2.0.0
-pyttsx3>=2.90
-reportlab>=4.0.0
-pillow>=10.0.0
-```
+## 8. CARLA Setup
 
-> MediaPipe needs `opencv-contrib-python`. Do **not** also install plain
-> `opencv-python` in the same venv (they conflict).
+1. Install CARLA separately and ensure the CARLA Python client is importable
+   from the activated environment.
+2. Start the CARLA server. If it is installed in the repository's supported
+   standard location, the command is:
 
----
+   ```powershell
+   & "C:\CARLA\CarlaUE4.exe"
+   ```
 
-## 18. How to Run
+   If CARLA is installed elsewhere, start that installation's executable
+   instead. The code connects to `localhost:2000` by default.
+3. `src/carla_context.py` uses the world/map already loaded in the CARLA
+   server. It does not load a specific map, so the map is whatever CARLA
+   reports as current.
+4. The context first reuses the first existing vehicle. If none exists, it
+   selects the first available `vehicle.*` blueprint and tries the first map
+   spawn point.
+5. `--route` dynamically chooses a validated destination spawn point and uses
+   the official CARLA `GlobalRoutePlanner` and `BasicAgent` to follow the
+   route at a target speed of 35 km/h. It prints route progress and the next
+   maneuver, and selects another route after reaching a destination.
+6. The CARLA spectator is moved smoothly behind and above the vehicle
+   (10 m back, 5 m high) rather than snapping directly each update.
+7. The standalone demo stops the vehicle with brake control on exit. There is
+   no separate vehicle-reset command or world-reset mechanism in the
+   repository; restart the CARLA server or rerun the demo to obtain a fresh
+   session.
 
-### Main dashboard application (entry point)
+CARLA PythonAPI agents are loaded directly first, then searched from the
+standard CARLA installation and import paths. If agents are found but their
+navigation dependencies cannot import, install the `networkx` and `Shapely`
+dependencies supplied/recommended by that CARLA release.
+
+## 9. Running the Project
+
+Use separate PowerShell windows for CARLA and the Python application.
+
+### A. Activate the virtual environment
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-python src\app_ui.py
 ```
 
-### Webcam monitor (OpenCV HUD)
+### B. Start CARLA
 
 ```powershell
-python src\drowsiness_demo.py
+& "C:\CARLA\CarlaUE4.exe"
 ```
 
-Press `q` in the OpenCV window to quit.
+The executable path is installation-specific; the repository does not contain
+the CARLA server.
 
-### Run the tests
+### C. Run the CARLA route demo
 
 ```powershell
+python -m src.carla_context --route
+```
+
+### D. Run the CARLA weather/day-night demo
+
+```powershell
+python -m src.carla_context --route --weather-demo
+```
+
+The weather demo changes every 30 seconds and cycles
+`ClearNoon → SoftRainNoon → HardRainNight → FoggyNight → ClearNight`.
+
+### E. Run the full dashboard/UI
+
+```powershell
+python src/app_ui.py
+```
+
+With CARLA running, the dashboard attempts to connect automatically. Without
+CARLA, its CARLA fields remain unavailable and the webcam/context pipeline can
+continue.
+
+Other repository demos include `python src\drowsiness_demo.py`,
+`python src\webcam_test.py`, and the focused EAR/MAR/landmark demos.
+
+## 10. CARLA Context
+
+When CARLA is active, `CarlaContext.get_context()` supplies:
+
+- vehicle position and a CARLA-simulated location/zone classification;
+- vehicle speed, speed level, and speed risk (`LOW`, `MODERATE`, `HIGH`, or
+  `VERY_HIGH`);
+- CARLA weather condition/risk from cloudiness, precipitation, fog, and
+  wetness;
+- `DAY` or `NIGHT` from the CARLA weather sun altitude (night adds a bounded
+  context risk);
+- vehicle state and driving-session duration.
+
+The currently checked-in `config/geofences.json` contains no configured real
+geofences. Therefore the normal location provider reports no configured
+high-risk zone unless a developer populates that file. CARLA's virtual
+location classifier is separate from real GPS/IP location.
+
+The `--weather-demo` cycle is elapsed-time based: each of five presets remains
+active for 30 seconds, then the cycle repeats. This is a CARLA environment
+demo, not traffic simulation. CARLA context amplifies existing driver risk;
+it does not by itself prove fatigue.
+
+## 11. Attention Engine
+
+The implementation is deterministic and rule-based:
+
+- `FatigueEngine` scores prolonged eye closure, yawn evidence, night context,
+  and driving-duration risk. Blink behaviour is tracked and can contribute as
+  supporting evidence; normal blinks do not independently mean drowsiness.
+- `DistractionMonitor` evaluates head turns and sustained downward gaze.
+- `AttentionEngine` fuses fatigue and distraction with fatigue as the dominant
+  contributor (`0.90` fatigue weight and `0.38` distraction weight), then
+  applies bounded location/weather/speed/time context boosts only when driver
+  risk is already present.
+- The combined score is smoothed asymmetrically: risk rises promptly and
+  recovery is held/gradual to avoid flicker.
+- Attention levels are `SAFE` (0–24), `MODERATE` (25–49), `HIGH` (50–74),
+  and `CRITICAL` (75–100).
+- Alert severity maps to `NORMAL`, `LOW_FATIGUE`/`ALERT`, `WARNING`, or
+  `DROWSY`. Higher severities require short persistence; recovery requires
+  persistent improvement.
+
+The README does not treat these engineering thresholds as accuracy results.
+
+## 12. Alerts
+
+Severity order is:
+
+```text
+NORMAL → LOW_FATIGUE → ALERT → WARNING → DROWSY
+```
+
+The current alert path provides:
+
+- `LOW_FATIGUE`: spoken caution;
+- `ALERT`: soft beep followed by voice;
+- `WARNING`: warning alarm followed by voice;
+- `DROWSY`: strong alarm followed by voice.
+
+Sound and voice do not overlap. A higher-priority alert interrupts a lower
+priority one; a lower-priority alert cannot interrupt a higher one. Audio is
+triggered on severity entry rather than every camera frame. Per-severity
+cooldowns are 30 s, 25 s, 20 s, and 15 s respectively, with episode recovery
+and global-gap protection. Alert display windows are 2 s, 3 s, 4 s, and 5 s.
+Recovery resets eligibility for a later episode. Audio failures are reported
+while visual monitoring continues.
+
+## 13. Testing
+
+The `tests/` directory contains deterministic unit tests for fatigue scoring,
+attention/distraction fusion, alert levels and stability, audio priority,
+context urgency, location/geofence transitions, weather, temporal eye/mouth
+tracking, face-loss safety, sessions, summaries, dashboard preferences, and
+startup behaviour.
+
+Run the complete suite from the repository root:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 python -m unittest discover -s tests -v
 ```
 
----
+The tests do not require a webcam. Dataset-based evaluation has not been
+completed; no accuracy, precision, recall, or F1 number is currently
+established by this repository.
 
-## 19. Demo Procedure
+## 14. Troubleshooting
 
-A simple first-review demonstration:
+### CARLA connection problems
 
-1. Run `python src\app_ui.py`.
-2. Click **START DRIVING**.
-3. Show the normal state (green, low risk).
-4. Blink normally → blink count increases, risk stays low.
-5. Yawn → small temporary risk increase (bounded).
-6. Repeated yawns / context → **LOW FATIGUE** (voice only, "Please stay alert.").
-7. More evidence → **ALERT** (~3 s soft beep → "Please stay attentive.").
-8. Stronger evidence → **WARNING** (~7 s warning alarm → voice).
-9. Prolonged eye closure / severe combined fatigue → **DROWSY** (~10 s strong
-   alarm → voice).
-10. Open the eyes → **recovery**, audio stops, status recovers.
-11. Click **STOP DRIVING** → session summary.
-12. **EXPORT PDF** → local report in `reports/`.
-13. **NEW DRIVING SESSION** or **EXIT**.
+- Confirm the CARLA server is running and listening on `localhost:2000`.
+- Start the Python command only after the server has finished loading a world.
+- The dashboard can run without CARLA, but CARLA fields will show unavailable.
+- `CARLA_HOST` and `CARLA_PORT` are optional advanced overrides; they are not
+  required for the normal setup.
 
-> During the demo, if `USE_DEMO_DRIVING_DURATION = True`, the 30-second driving
-> duration is a **demo shortcut** and the UI shows **DEMO MODE**. The real
-> project threshold is **3 hours**.
+### CARLA PythonAPI or agent import errors
 
----
+- Confirm `import carla` works in the activated `.venv`.
+- Confirm the CARLA PythonAPI contains
+  `agents/navigation/global_route_planner.py`,
+  `basic_agent.py`, and `local_planner.py`.
+- If the loader reports missing agent dependencies, install the matching
+  CARLA PythonAPI dependencies such as `networkx` and `Shapely`.
+- Do not install an unrelated CARLA client version without matching it to the
+  server/PythonAPI.
 
-## 20. Testing
+### Vehicle or route problems
 
-The test suite is deterministic and requires no webcam or speakers. It covers
-temporal logic, fatigue scoring, alert escalation (including the ALERT level),
-audio ordering, audio priority interruption, volume settings, session
-management, summary/PDF, dashboard preferences, monotonic timing, yawn cap, and
-no-face / multiple-face safety.
+- The current world must provide map spawn points.
+- Existing vehicles are reused; stop/close the previous demo if it owns the
+  desired vehicle.
+- A route is selected from available spawn points and can fail if the loaded
+  map has no suitable finite route. Try a standard CARLA road map and rerun.
+- Stop with `Ctrl+C`; the standalone demo applies the brake in its cleanup
+  path.
 
-Run:
+### Dashboard, Tkinter, or camera problems
 
-```powershell
-python -m unittest discover -s tests -v
-```
+- Run from the repository root so `models/face_landmarker.task` and project
+  modules resolve correctly.
+- Verify that the webcam is connected and not exclusively open in another
+  application. `python src\webcam_test.py` is the repository camera check.
+- Verify that Python was installed with Tk support. The dashboard requires
+  Tkinter and Pillow.
+- If no face or multiple faces are visible, analysis intentionally pauses.
+- If the model error says the `.task` file is missing, restore it at
+  `models/face_landmarker.task`.
 
-The suite passes with the current test modules (247 tests, including
-alert-stability, volume-independence, cold-start rate, geofence, and
-failure-safe location/weather coverage).
+### Audio problems
 
----
+- This implementation uses Windows `winsound` for WAV playback and
+  `pyttsx3` for speech; Windows is therefore the supported audio environment.
+- Check Windows output-device and speech settings.
+- Disable voice or alarm sounds in Settings if a device/driver is unavailable;
+  visual monitoring continues.
+- Keep `assets/sounds/` available. Missing/generated tones are reported by the
+  audio path rather than silently changing the detection result.
 
-## 21. Current Limitations
+### Dependency or context problems
 
-- Depends on a visible, roughly frontal face in a laptop webcam.
-- Lighting-sensitive (no low-light enhancement).
-- Thresholds and weights are engineering defaults, not a validated accuracy
-  study.
-- No formal labelled-dataset accuracy evaluation.
-- Not automotive-certified.
-- No actual vehicle-movement detection.
+- Activate `.venv` before installing or running commands.
+- Install exactly the declared dependencies with
+  `python -m pip install -r requirements.txt`.
+- Location and Open-Meteo network failures are expected to fall back to cache
+  or unavailable context; they do not replace camera measurements with fake
+  values.
 
----
+## 15. Known Limitations
 
-## 22. Viva Explanation (short script)
+- This is a webcam/CARLA simulation prototype, not real-vehicle deployment.
+- Dataset validation and formal accuracy measurement are pending.
+- Traffic simulation is not currently included.
+- A webcam can lose landmarks under poor lighting, occlusion, extreme head
+  pose, camera movement, or multiple faces.
+- No low-light enhancement, night vision, phone detection, speech detection,
+  or driver identity model is included.
+- CARLA uses the world already loaded by the server; the repository does not
+  guarantee a particular map or CARLA release.
+- Real geofences are empty by default and require verified configuration.
+- Weather/location context depends on simulator/network/cache availability.
+- Hardware minimums and production safety thresholds have not been formally
+  established.
 
-1. **Problem:** Drowsy driving is dangerous; an early-warning system using a
-   common laptop camera helps.
-2. **Solution:** Detect face landmarks → measure eye openness (EAR) and mouth
-   openness (MAR) → track events over time → add night/long-driving context →
-   score risk with a rule-based engine → warn with sound + voice.
-3. **Why MediaPipe?** Reliable on-device facial landmarks without training a
-   detector.
-4. **Why EAR/MAR?** Simple geometric ratios that change as eyes/mouth open or
-   close.
-5. **Why temporal logic?** One closed frame is usually a blink; duration
-   separates blinks from dangerous prolonged closure (same for yawns vs
-   talking).
-6. **Why a rule-based fatigue engine?** One authoritative, explainable place
-   for fusion; nothing else re-implements scoring.
-7. **Why context?** Night and long driving raise risk a little but cannot
-   alone mark DROWSY.
-8. **Why alarms escalate?** Progressive sound → voice, once per state entry,
-   with priority interruption and recovery/cooldown protection.
-9. **Prevention:** Sound + voice + visual alerts prompt the driver to take a
-   break.
-10. **Honesty:** Rule-based engineering prototype; formal dataset accuracy is
-    future work.
+## 16. Future Work
 
----
+The following are planned or suitable future extensions, not current features:
 
-## 23. Honesty / Safety Statement
+- traffic simulation and richer surrounding-vehicle context;
+- a first-person/in-cabin CARLA view;
+- additional labelled datasets and repeatable dataset evaluation;
+- richer context modelling and real-world location validation;
+- further alert/audio personalization and validation;
+- real-world vehicle and hardware validation.
 
-This is a **prototype**. Thresholds and weights are engineering defaults tuned
-on a laptop webcam. No scientific accuracy percentage should be claimed without
-a formal evaluation. The system should **not** be treated as a certified safety
-device.
+## 17. Development / Contribution Notes
 
----
+Core changes belong in the relevant module under `src/`; tests for decision
+logic and state transitions belong under `tests/`. Keep dependency changes in
+`requirements.txt` and update this README when setup or public entry points
+change. The project currently uses ordinary Git branch-based development; no
+additional contribution workflow is defined in the repository.
 
-## 24. Change Log
+Avoid committing generated reports, caches, virtual-environment files, or
+machine-specific CARLA installations. Changes to scoring, escalation, or
+context should include deterministic tests where practical.
 
-**Current update — down-gaze / face-loss separation:**
+## 18. License / Acknowledgements
 
-- **Looking down is not fatigue:** `FatigueEngine` now suppresses eye-closure
-  fatigue evidence while the head is actively classified as looking down
-  (downward head orientation compresses the apparent eye opening / EAR). Downward
-  orientation still contributes as distraction via the existing `looking_down`
-  channel — never as a fatigue diagnosis.
-- **Face-loss grace period:** a brief landmark dropout (e.g. during a head turn)
-  keeps the last valid state for a short, time-based grace window and shows
-  "Face temporarily unavailable" instead of resetting the fatigue/attention
-  engines, recording no-face samples, or emitting a NORMAL/fatigue alert.
-  Prolonged absence still surfaces as monitoring-unavailable.
-- **Tests:** added `tests/test_face_loss_and_head_down.py`.
+No license file or explicit repository license is currently defined, so no
+license is asserted here.
 
-**Previous update — GPS / weather / zone context audit + honest zone handling:**
-
-- **Honest empty-geofence wording:** with no configured/matching zone the UI now
-  reports "No configured high-risk zone" and "Location risk: Baseline" instead
-  of a neutral "Normal Road" label that could imply a verified-safe road.
-- **Zone entry/exit tracking:** `ZoneTransitionTracker` emits one entry event on
-  entering a configured zone and one exit event on leaving (no per-frame spam);
-  events are recorded in the session (entry + exit counts) and shown in the UI.
-- **Geofence population workflow:** added `tools/build_geofences.py`
-  (OpenStreetMap / Overpass) plus `docs/ARCHITECTURE.md` documenting the real
-  runtime flow.
-- **Context panel clipping fix:** the CONTEXT card no longer clips its content.
-- **Tests:** added `tests/test_zone_transitions.py` (zone entry/exit, honest
-  empty-geofence wording, geofence matching + malformed fallback, coordinates /
-  IP fallback passthrough, context reaching the attention engine).
-
-**Previous update — neuro-symbolic attention + stabilization pass:**
-
-- **Independent volumes restored:** `alert_volume` (LOW FATIGUE / ALERT sound +
-  voice) and `alarm_volume` (WARNING / DROWSY sound + voice) are separate
-  Settings sliders and persist independently.
-- **Cold-start rate fix:** blink/yawn rate use actual elapsed monitoring time
-  during the first window instead of dividing by the full 60 s.
-- **WARNING persistence:** HIGH attention risk must persist ~0.35 s before a
-  WARNING alert is emitted (single-frame spikes do not fire).
-- **ALERT hysteresis:** enter ALERT at risk ≥ 35, exit at ≤ 32 (no more
-  LOW FATIGUE ↔ ALERT flapping).
-- **Global audio gap:** ~2 s minimum between different alerts (higher-priority
-  escalation and DROWSY still interrupt immediately).
-- **Geofence classification:** configurable real high-risk zones via
-  `config/geofences.json` + haversine distance (demo zones preserved).
-- **Performance:** GPS/weather network work moved to a background worker so the
-  camera loop never blocks on HTTP.
-
-**Previous update — final alert escalation pass:**
-
-- **5-level alert system:** added the **ALERT** severity level between LOW
-  FATIGUE and WARNING. Severity mapping: NORMAL (0–19), LOW FATIGUE (20–34),
-  ALERT (35–49), WARNING (50–69), DROWSY (70–100).
-- **LOW FATIGUE is voice only** (no loud alarm). ALERT uses a ~3 s soft beep,
-  WARNING ~7 s, DROWSY ~10 s — each followed by its voice message.
-- **Progressive, state-entry, cancellable alerts:** higher severity interrupts
-  lower severity; lower never interrupts higher; no repeat while the same state
-  persists; recovery resets alert eligibility.
-- **Audio priority interruption fixed:** interruptible WAV playback
-  (`winsound.SND_MEMORY | SND_ASYNC` with `SND_PURGE`). The interrupted alarm's
-  voice is not spoken.
-- **Audio volume controls now work:** `alert_volume` controls LOW FATIGUE /
-  ALERT and voice; `alarm_volume` controls WARNING and DROWSY. Volume is applied
-  to the PCM samples at runtime — the original `assets/sounds/*.wav` files are
-  never modified.
-- **Natural-completion fix:** an alert that finishes naturally releases its
-  priority slot, so later alerts (e.g. after recovery) can play again.
-- **README updated** to reflect the current implementation only.
+The project uses Google's MediaPipe Face Landmarker task model and the CARLA
+simulator/PythonAPI. The model and simulator remain subject to their
+respective upstream terms.
