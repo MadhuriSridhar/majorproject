@@ -42,6 +42,53 @@ class RiskSample:
     duration_risk: float | None
 
 
+@dataclass(frozen=True)
+class AlertnessSample:
+    """Authoritative sampled alertness state for all downstream surfaces."""
+
+    timestamp_s: float
+    alertness: float | None
+    attention_risk: float | None
+    fatigue: float | None
+    distraction: float | None
+    environmental_risk: float | None
+    severity: str
+    primary_reason: str
+
+
+def trend_series(alertness_history: list[AlertnessSample]) -> dict[str, list[float | None]]:
+    """Split sampled history into aligned, graph-ready multi-series data.
+
+    Returns a dict with parallel lists keyed by ``x`` (timestamps, seconds),
+    ``alertness`` (0-100, higher = better), ``fatigue`` (0-100 risk),
+    ``distraction`` (0-100 risk), and ``environmental`` (0-100 context risk).
+    ``None`` entries mark a missing sample so a plot can break the line instead
+    of fabricating a value.
+    """
+    return {
+        "x": [s.timestamp_s for s in alertness_history],
+        "alertness": [s.alertness for s in alertness_history],
+        "fatigue": [s.fatigue for s in alertness_history],
+        "distraction": [s.distraction for s in alertness_history],
+        "environmental": [s.environmental_risk for s in alertness_history],
+    }
+
+
+@dataclass
+class AlertEvent:
+    """One continuous alert episode, including any later escalation."""
+
+    start_time_s: float
+    end_time_s: float | None
+    severity: str
+    primary_reason: str
+    contributing_factors: tuple[str, ...] = ()
+    alertness_at_start: float = 100.0
+    minimum_alertness: float = 100.0
+    recovery_time_s: float | None = None
+    action: str = ""
+
+
 @dataclass
 class SessionStats:
     """Aggregated statistics for the current (or last) session."""
@@ -63,6 +110,23 @@ class SessionStats:
     final_status: str = "NORMAL"
     risk_history: list[RiskSample] = field(default_factory=list)
     risk_factor_history: dict[str, list[float | None]] = field(default_factory=dict)
+    alertness_history: list[AlertnessSample] = field(default_factory=list)
+    alert_events: list[AlertEvent] = field(default_factory=list)
+    average_alertness: float = 100.0
+    minimum_alertness: float = 100.0
+    maximum_alertness: float = 100.0
+    time_safe_s: float = 0.0
+    time_moderate_s: float = 0.0
+    time_high_s: float = 0.0
+    time_critical_s: float = 0.0
+    distraction_event_count: int = 0
+    fatigue_event_count: int = 0
+    recovery_event_count: int = 0
+    high_risk_zone_event_count: int = 0
+    zone_exit_event_count: int = 0
+    zone_transitions: list = field(default_factory=list)
+    average_distraction: float = 0.0
+    average_environmental_risk: float = 0.0
 
 
 class SessionManager:
@@ -85,6 +149,12 @@ class SessionManager:
         self._blink_rate_sum = 0.0
         self._blink_rate_samples = 0
         self._last_risk_sample_s: float | None = None
+        self._alertness_sum = 0.0
+        self._alertness_samples = 0
+        self._distraction_sum = 0.0
+        self._environment_sum = 0.0
+        self._last_alertness_severity = "SAFE"
+        self._active_alert_event: AlertEvent | None = None
 
     @property
     def start_mono_s(self) -> float:
@@ -118,6 +188,12 @@ class SessionManager:
         self._blink_rate_samples = 0
         self._last_severity = None
         self._last_risk_sample_s = None
+        self._alertness_sum = 0.0
+        self._alertness_samples = 0
+        self._distraction_sum = 0.0
+        self._environment_sum = 0.0
+        self._last_alertness_severity = "SAFE"
+        self._active_alert_event = None
         return self._stats.session_id
 
     def stop(self) -> SessionStats:
@@ -134,7 +210,33 @@ class SessionManager:
             self._stats.average_fatigue_risk = self._risk_sum / self._risk_samples
         if self._blink_rate_samples > 0:
             self._stats.average_blink_rate = self._blink_rate_sum / self._blink_rate_samples
+        if self._alertness_samples > 0:
+            self._stats.average_alertness = self._alertness_sum / self._alertness_samples
+            self._stats.average_distraction = self._distraction_sum / self._alertness_samples
+            self._stats.average_environmental_risk = self._environment_sum / self._alertness_samples
+        if self._stats.alertness_history:
+            values = [s.alertness for s in self._stats.alertness_history if s.alertness is not None]
+            if values:
+                self._stats.minimum_alertness = min(values)
+                self._stats.maximum_alertness = max(values)
+            self._finalize_state_durations()
+        if self._active_alert_event is not None:
+            self._active_alert_event.end_time_s = self._stats.alertness_history[-1].timestamp_s if self._stats.alertness_history else None
+            self._active_alert_event = None
         return self._stats
+
+    def _finalize_state_durations(self) -> None:
+        history = self._stats.alertness_history
+        for current, following in zip(history, history[1:]):
+            seconds = max(0.0, following.timestamp_s - current.timestamp_s)
+            if current.severity in ("SAFE", "NORMAL"):
+                self._stats.time_safe_s += seconds
+            elif current.severity in ("MODERATE", "LOW_FATIGUE", "ALERT"):
+                self._stats.time_moderate_s += seconds
+            elif current.severity in ("HIGH", "WARNING"):
+                self._stats.time_high_s += seconds
+            elif current.severity in ("CRITICAL", "DROWSY"):
+                self._stats.time_critical_s += seconds
 
     def driving_result(self, now_s: float | None = None):
         """Return the current DrivingDurationResult from the backend tracker."""
@@ -163,6 +265,13 @@ class SessionManager:
         return (
             self._last_risk_sample_s is None
             or (now - self._last_risk_sample_s) >= RISK_SAMPLE_INTERVAL_S
+        )
+
+    def _should_sample_alertness(self, now: float) -> bool:
+        """Sample alertness independently while keeping the same cadence."""
+        return (
+            not self._stats.alertness_history
+            or (now - self._stats.alertness_history[-1].timestamp_s) >= RISK_SAMPLE_INTERVAL_S
         )
 
     def record_no_face(self, now_s: float | None = None) -> None:
@@ -202,7 +311,33 @@ class SessionManager:
             if len(series) > MAX_RISK_HISTORY:
                 self._stats.risk_factor_history[key] = series[-MAX_RISK_HISTORY:]
 
-    def update(self, decision, now_s: float | None = None) -> None:
+    def record_zone_transition(self, transition, now_s: float | None = None) -> None:
+        """Record one zone entry/exit/change event (event semantics, not per frame).
+
+        `transition` is a ZoneTransition (any object exposing .event / .zone_type /
+        .zone_name). Values are read via getattr so this module stays decoupled
+        from location_context.
+        """
+        if not self._active:
+            return
+        now = now_s if now_s is not None else time.monotonic()
+        event = str(getattr(transition, "event", "enter"))
+        if event == "enter":
+            self._stats.high_risk_zone_event_count += 1
+        elif event == "exit":
+            self._stats.zone_exit_event_count += 1
+        self._stats.zone_transitions.append(
+            {
+                "time_s": now,
+                "event": event,
+                "zone_type": str(getattr(transition, "zone_type", "") or ""),
+                "zone_name": str(getattr(transition, "zone_name", "") or ""),
+                "from_zone_name": str(getattr(transition, "from_zone_name", "") or ""),
+                "to_zone_name": str(getattr(transition, "to_zone_name", "") or ""),
+            }
+        )
+
+    def update(self, decision, now_s: float | None = None, attention=None, alert_result=None) -> None:
         """
         Record one FatigueDecision sample into the session.
 
@@ -247,6 +382,66 @@ class SessionManager:
             self._stats.maximum_fatigue_risk = max(
                 self._stats.maximum_fatigue_risk, float(risk)
             )
+
+        if attention is not None:
+            alertness = max(0.0, min(100.0, float(attention.alertness_score)))
+            distraction = max(0.0, min(100.0, float(attention.distraction_score)))
+            environmental = max(
+                0.0,
+                min(100.0, max(float(getattr(attention, "location_risk", 0.0)), float(getattr(attention, "weather_risk", 0.0)))),
+            )
+            if self._should_sample_alertness(now):
+                sample = AlertnessSample(
+                    timestamp_s=now,
+                    alertness=alertness,
+                    attention_risk=100.0 - alertness,
+                    fatigue=float(attention.fatigue_score),
+                    distraction=distraction,
+                    environmental_risk=environmental,
+                    severity=str(attention.level),
+                    primary_reason=str(attention.primary_reason or ""),
+                )
+                self._stats.alertness_history.append(sample)
+                if len(self._stats.alertness_history) > MAX_RISK_HISTORY:
+                    self._stats.alertness_history = self._stats.alertness_history[-MAX_RISK_HISTORY:]
+            self._alertness_sum += alertness
+            self._alertness_samples += 1
+            self._distraction_sum += distraction
+            self._environment_sum += environmental
+            if distraction >= 20.0 and self._last_alertness_severity not in ("MODERATE", "HIGH", "CRITICAL"):
+                self._stats.distraction_event_count += 1
+            if float(attention.fatigue_score) >= 25.0 and self._last_alertness_severity not in ("MODERATE", "HIGH", "CRITICAL"):
+                self._stats.fatigue_event_count += 1
+            if self._last_alertness_severity in ("MODERATE", "HIGH", "CRITICAL") and attention.level == "SAFE":
+                self._stats.recovery_event_count += 1
+            # Zone entry/exit events are recorded via record_zone_transition()
+            # (driven by the camera worker's ZoneTransitionTracker), so entry is
+            # a single event rather than a per-frame repeated notification.
+            self._last_alertness_severity = str(attention.level)
+
+            if alert_result is not None and alert_result.active_severity != "NORMAL":
+                if self._active_alert_event is None:
+                    self._active_alert_event = AlertEvent(
+                        start_time_s=now,
+                        end_time_s=None,
+                        severity=alert_result.active_severity,
+                        primary_reason=str(alert_result.reason or attention.primary_reason),
+                        contributing_factors=tuple(alert_result.contributing_factors),
+                        alertness_at_start=alertness,
+                        minimum_alertness=alertness,
+                        action=str(getattr(attention, "recommendation", "") or ""),
+                    )
+                    self._stats.alert_events.append(self._active_alert_event)
+                else:
+                    event = self._active_alert_event
+                    if priority := {"NORMAL": 0, "LOW_FATIGUE": 1, "ALERT": 2, "WARNING": 3, "DROWSY": 4}.get(alert_result.active_severity, 0):
+                        if priority > {"NORMAL": 0, "LOW_FATIGUE": 1, "ALERT": 2, "WARNING": 3, "DROWSY": 4}.get(event.severity, 0):
+                            event.severity = alert_result.active_severity
+                    event.minimum_alertness = min(event.minimum_alertness, alertness)
+            elif self._active_alert_event is not None:
+                self._active_alert_event.end_time_s = now
+                self._active_alert_event.recovery_time_s = max(0.0, now - self._active_alert_event.start_time_s)
+                self._active_alert_event = None
 
         # Blink rate aggregation (from evidence if available).
         blink_rate = getattr(decision.evidence, "blink_rate", None)

@@ -83,11 +83,13 @@ class EyeClosureTracker:
         self._prolonged = False
         self._blink_counted_for_event = False
         self._blink_timestamps: list[float] = []
+        self._monitoring_start_s: float | None = None
 
     def reset(self) -> None:
         """Clear tracker state (does not change configuration)."""
         self.blink_count = 0
         self._blink_timestamps.clear()
+        self._monitoring_start_s = None
         self._abort_closure()
 
     def _abort_closure(self) -> None:
@@ -102,7 +104,15 @@ class EyeClosureTracker:
             return None
         cutoff = timestamp_s - window_s
         count = sum(1 for ts in self._blink_timestamps if ts >= cutoff)
-        return (count / window_s) * 60.0 if window_s > 0 else float(count)
+        # Cold-start: while the session has been running for less than the full
+        # window, divide by the actual elapsed monitoring time instead of the
+        # full window so the displayed rate is not artificially low.
+        divisor = window_s
+        if self._monitoring_start_s is not None:
+            elapsed = timestamp_s - self._monitoring_start_s
+            if elapsed > 0.0:
+                divisor = min(window_s, elapsed)
+        return (count / divisor) * 60.0 if divisor > 0 else float(count)
 
     def _duration(self, timestamp_s: float) -> float:
         if self._closure_start_s is None:
@@ -123,6 +133,9 @@ class EyeClosureTracker:
 
         Returns the updated temporal state for UI display.
         """
+        if self._monitoring_start_s is None:
+            self._monitoring_start_s = timestamp_s
+
         if average_ear is None:
             # Do not keep a closure timer running without valid eye data.
             self._abort_closure()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -118,6 +119,68 @@ class RiskHistoryTests(unittest.TestCase):
         for i in range(5):
             self.manager.update(decision, now_s=float(i))
         self.assertEqual(len(self.manager.stats.risk_history), 5)
+
+    def test_alertness_history_and_statistics_are_recorded(self) -> None:
+        attention = SimpleNamespace(
+            alertness_score=82.0,
+            distraction_score=12.0,
+            fatigue_score=10.0,
+            level="SAFE",
+            primary_reason="Attentive",
+            location_risk=0.0,
+            weather_risk=5.0,
+            location_zone="none",
+        )
+        alert = SimpleNamespace(
+            active_severity="NORMAL",
+            reason="",
+            contributing_factors=(),
+        )
+        decision = make_decision(self.engine, face_detected=True)
+        self.manager.update(decision, now_s=1.0, attention=attention, alert_result=alert)
+        attention.alertness_score = 64.0
+        attention.level = "MODERATE"
+        self.manager.update(decision, now_s=2.0, attention=attention, alert_result=alert)
+        stats = self.manager.stop()
+
+        self.assertEqual(len(stats.alertness_history), 2)
+        self.assertAlmostEqual(stats.average_alertness, 73.0)
+        self.assertAlmostEqual(stats.minimum_alertness, 64.0)
+        self.assertAlmostEqual(stats.maximum_alertness, 82.0)
+        self.assertGreater(stats.time_safe_s, 0.0)
+
+    def test_continuous_alert_is_one_episode_with_escalation(self) -> None:
+        attention = SimpleNamespace(
+            alertness_score=45.0,
+            distraction_score=50.0,
+            fatigue_score=30.0,
+            level="HIGH",
+            primary_reason="Sustained attention away from the road",
+            location_risk=0.0,
+            weather_risk=0.0,
+            location_zone="none",
+        )
+        decision = make_decision(self.engine, face_detected=True)
+        warning = SimpleNamespace(
+            active_severity="WARNING", reason=attention.primary_reason,
+            contributing_factors=("distraction",),
+        )
+        drowsy = SimpleNamespace(
+            active_severity="DROWSY", reason=attention.primary_reason,
+            contributing_factors=("distraction", "fatigue"),
+        )
+        normal = SimpleNamespace(active_severity="NORMAL", reason="", contributing_factors=())
+        self.manager.update(decision, now_s=1.0, attention=attention, alert_result=warning)
+        self.manager.update(decision, now_s=2.0, attention=attention, alert_result=warning)
+        self.manager.update(decision, now_s=3.0, attention=attention, alert_result=drowsy)
+        attention.alertness_score = 90.0
+        attention.level = "SAFE"
+        self.manager.update(decision, now_s=4.0, attention=attention, alert_result=normal)
+        self.manager.stop()
+
+        self.assertEqual(len(self.manager.stats.alert_events), 1)
+        self.assertEqual(self.manager.stats.alert_events[0].severity, "DROWSY")
+        self.assertEqual(self.manager.stats.alert_events[0].primary_reason, warning.reason)
 
 
 class CounterTests(unittest.TestCase):

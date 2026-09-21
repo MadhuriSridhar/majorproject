@@ -158,12 +158,28 @@ def main() -> None:
             attention = None
             alert_result = None
             if face_detected and not multiple_faces:
+                head_down = bool(
+                    distraction_obs is not None
+                    and getattr(distraction_obs.head, "looking_away", False)
+                    and getattr(distraction_obs.head, "direction", "") == "down"
+                )
+                head_turned = bool(
+                    distraction_obs is not None
+                    and getattr(distraction_obs.head, "looking_away", False)
+                    and getattr(distraction_obs.head, "direction", "") in ("left", "right")
+                )
+                eyes_not_visible = bool(head_down or head_turned)
+                mouth_not_visible = bool(head_down or head_turned)
                 evidence = build_fatigue_evidence(
                     eye=eye_state,
                     mouth=mouth_state,
                     time_ctx=time_ctx,
                     driving=driving,
                     face_detected=True,
+                    head_down=head_down,
+                    head_turned=head_turned,
+                    eyes_not_visible=eyes_not_visible,
+                    mouth_not_visible=mouth_not_visible,
                 )
                 decision = fatigue_engine.update(evidence, elapsed_s)
                 fatigue_risk = (
@@ -178,10 +194,26 @@ def main() -> None:
                     face_ok=True,
                 )
                 alert_result = alert_controller.update(
-                    attention.alert_severity, elapsed_s
+                    attention.alert_severity,
+                    elapsed_s,
+                    reason=attention.primary_reason,
+                    contributing_factors=(
+                        attention.distraction_primary,
+                        "fatigue" if attention.fatigue_score >= 50.0 else "stable",
+                    ),
+                    alertness_score=attention.alertness_score,
+                    fatigue_score=attention.fatigue_score,
+                    distraction_score=attention.distraction_score,
                 )
                 if alert_result.should_play_audio:
-                    audio_engine.play_alert(alert_result.audio_severity)
+                    audio_engine.play_alert(
+                        alert_result.audio_severity,
+                        reason=attention.primary_reason,
+                        contributing_factors=(
+                            attention.distraction_primary,
+                            "fatigue" if attention.fatigue_score >= 50.0 else "stable",
+                        ),
+                    )
             else:
                 fatigue_engine.reset()
                 attention_engine.reset()

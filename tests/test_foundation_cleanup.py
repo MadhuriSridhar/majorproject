@@ -8,16 +8,51 @@ safety, alert duration configuration, and audio ordering.
 from __future__ import annotations
 
 import sys
+import types
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+if "carla" not in sys.modules:
+    fake_carla = types.ModuleType("carla")
+
+    class _LaneType:
+        Driving = "driving"
+
+    class _VehicleControl:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class _Location:
+        def __init__(self, x=0.0, y=0.0, z=0.0):
+            self.x = x
+            self.y = y
+            self.z = z
+
+    class _Transform:
+        def __init__(self, location=None, rotation=None):
+            self.location = location or _Location()
+            self.rotation = rotation or types.SimpleNamespace(yaw=0.0)
+
+    fake_carla.LaneType = _LaneType
+    fake_carla.VehicleControl = _VehicleControl
+    fake_carla.Location = _Location
+    fake_carla.Transform = _Transform
+    fake_carla.Vehicle = object
+    fake_carla.Client = object
+    fake_carla.World = object
+    sys.modules["carla"] = fake_carla
+
 from alert_escalation import AlertEscalationController  # noqa: E402
-from app_ui import resolve_driver_state, should_run_analysis  # noqa: E402
+from app_ui import format_carla_context, resolve_driver_state, should_run_analysis  # noqa: E402
 from audio_engine import AudioBackend, AudioSettings  # noqa: E402
-from fatigue_engine import FatigueEngine, FatigueEvidence  # noqa: E402
+from fatigue_engine import (  # noqa: E402
+    RECENT_YAWN_MAX,
+    FatigueEngine,
+    FatigueEvidence,
+)
 from predefined_sounds import (  # noqa: E402
     ALERT_ALARM_DURATION_SECONDS,
     DROWSY_ALARM_DURATION_SECONDS,
@@ -31,6 +66,115 @@ from temporal_mouth import YawnTracker  # noqa: E402
 
 def E(**kwargs) -> FatigueEvidence:
     return FatigueEvidence(**kwargs)
+
+
+class CarlaRouteSelectionTests(unittest.TestCase):
+    def test_route_selection_prefers_unvisited_driving_branch(self) -> None:
+        from carla_context import CarlaContext  # noqa: E402
+
+        context = CarlaContext.__new__(CarlaContext)
+        context._visited_waypoints = {
+            (10, 1, 0, 0.0),
+            (10, 1, 0, 8.0),
+            (11, 0, 0, 0.0),
+        }
+        context._recent_waypoints = []
+
+        current = types.SimpleNamespace(
+            road_id=10,
+            section_id=1,
+            lane_id=0,
+            s=6.0,
+            lane_type="driving",
+            transform=types.SimpleNamespace(
+                location=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                rotation=types.SimpleNamespace(yaw=0.0),
+            ),
+        )
+        straight = types.SimpleNamespace(
+            road_id=10,
+            section_id=1,
+            lane_id=0,
+            s=14.0,
+            lane_type="driving",
+            transform=types.SimpleNamespace(
+                location=types.SimpleNamespace(x=0.0, y=20.0, z=0.0),
+                rotation=types.SimpleNamespace(yaw=0.0),
+            ),
+        )
+        left = types.SimpleNamespace(
+            road_id=11,
+            section_id=0,
+            lane_id=0,
+            s=2.0,
+            lane_type="driving",
+            transform=types.SimpleNamespace(
+                location=types.SimpleNamespace(x=1.0, y=5.0, z=0.0),
+                rotation=types.SimpleNamespace(yaw=90.0),
+            ),
+        )
+        right = types.SimpleNamespace(
+            road_id=12,
+            section_id=0,
+            lane_id=0,
+            s=2.0,
+            lane_type="driving",
+            transform=types.SimpleNamespace(
+                location=types.SimpleNamespace(x=-2.0, y=5.0, z=0.0),
+                rotation=types.SimpleNamespace(yaw=-90.0),
+            ),
+        )
+        current.next = lambda distance: [straight, left, right]
+
+        target = context._select_target_waypoint(current)
+        self.assertIsNotNone(target)
+        self.assertNotEqual(target.road_id, 10)
+        self.assertIn(target.road_id, (11, 12))
+
+
+class CarlaContextDisplayTests(unittest.TestCase):
+    def test_unavailable_display(self) -> None:
+        self.assertEqual(
+            format_carla_context(None),
+            {
+                "vehicle": "UNAVAILABLE",
+                "speed": "--",
+                "weather": "--",
+                "time": "--",
+                "session": "--",
+                "carla_zone": "--",
+                "carla_position": "--",
+                "zone_risk": "--",
+            },
+        )
+
+    def test_connected_display_uses_snapshot_fields(self) -> None:
+        display = format_carla_context(
+            {
+                "carla_connected": True,
+                "vehicle_state": "MOVING",
+                "speed_kmh": 7.04,
+                "driving_session_id": 3,
+                "weather": {"condition": "CLEAR"},
+                "time": {"period": "DAY"},
+            }
+        )
+        self.assertEqual(display["vehicle"], "MOVING")
+        self.assertEqual(display["speed"], "7.0 km/h")
+        self.assertEqual(display["weather"], "CLEAR")
+        self.assertEqual(display["time"], "DAY")
+        self.assertEqual(display["session"], "3")
+
+    def test_no_vehicle_display(self) -> None:
+        display = format_carla_context(
+            {
+                "carla_connected": True,
+                "vehicle_state": "NO_VEHICLE",
+                "speed_kmh": 0.0,
+            }
+        )
+        self.assertEqual(display["vehicle"], "NO_VEHICLE")
+        self.assertEqual(display["speed"], "0.0 km/h")
 
 
 class YawnContributionCapTests(unittest.TestCase):
@@ -52,8 +196,9 @@ class YawnContributionCapTests(unittest.TestCase):
         engine = FatigueEngine()
         one = engine.decide(E(yawn_detected=True, yawn_count=1, recent_yawn_frequency=1.0, face_detected=True))
         many = engine.decide(E(yawn_detected=True, yawn_count=20, recent_yawn_frequency=30.0, face_detected=True))
-        # Both bounded; high frequency reaches the cap.
-        self.assertLessEqual(many.breakdown["yawn_risk"], 15.0)
+        # Repeated yawns strengthen the contribution but stay within RECENT_YAWN_MAX.
+        self.assertGreater(many.breakdown["yawn_risk"], one.breakdown["yawn_risk"])
+        self.assertLessEqual(many.breakdown["yawn_risk"], RECENT_YAWN_MAX)
         self.assertLessEqual(one.breakdown["yawn_risk"], 15.0)
 
     def test_yawn_does_not_overwhelm_prolonged_eye(self) -> None:

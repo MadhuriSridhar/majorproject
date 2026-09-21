@@ -21,7 +21,8 @@ from distraction_monitor import (  # noqa: E402
     LOOK_DOWN_MIN_S,
     PASSENGER_MIN_S,
 )
-from head_pose import HeadPoseObservation  # noqa: E402
+from head_pose import HeadPoseObservation, HeadPoseTracker  # noqa: E402
+from head_pose import direction_from_angles, estimate_head_angles  # noqa: E402
 
 
 class ScriptedHeadTracker:
@@ -127,6 +128,15 @@ class DistractionTemporalTests(unittest.TestCase):
         self.assertGreaterEqual(obs.distraction_risk, 28.0)
         self.assertIn(obs.primary, ("head_turn_left", "passenger_side"))
 
+    def test_sustained_head_turn_activates_promptly(self) -> None:
+        t = 0.0
+        self.tracker.set_away("left", 0.0)
+        self.mon.update(None, 640, 480, t)
+        self.tracker.set_away("left", 0.5)
+        obs = self.mon.update(None, 640, 480, 0.5)
+        self.assertTrue(obs.head.active)
+        self.assertLessEqual(obs.head.duration_s, 0.5)
+
     def test_looking_down_off_road_persists(self) -> None:
         for t in (0.0, 0.5, 1.0, 2.0, 3.0, 4.0):
             self.tracker.set_away("down", t)
@@ -160,6 +170,84 @@ class DistractionTemporalTests(unittest.TestCase):
         cleared = self.mon.update(None, 640, 480, 3.6 + CHANNEL_CLEAR_S + 0.05)
         self.assertFalse(cleared.head_turn_left.active)
         self.assertLess(cleared.distraction_risk, active.distraction_risk)
+
+
+class LandmarkHeadPoseTests(unittest.TestCase):
+    def _landmarks(self, nose_x: float):
+        from types import SimpleNamespace
+
+        points = [SimpleNamespace(x=0.5, y=0.5, z=0.0) for _ in range(264)]
+        points[1] = SimpleNamespace(x=nose_x, y=0.50, z=0.0)
+        points[152] = SimpleNamespace(x=0.50, y=0.82, z=0.0)
+        points[33] = SimpleNamespace(x=0.38, y=0.40, z=0.0)
+        points[263] = SimpleNamespace(x=0.62, y=0.40, z=0.0)
+        return points
+
+    def test_normalized_landmark_geometry_reaches_lateral_gate(self) -> None:
+        yaw, pitch, confidence = estimate_head_angles(self._landmarks(0.58), 1000, 800)
+        self.assertGreater(confidence, 0.0)
+        self.assertEqual(direction_from_angles(yaw, pitch), "left")
+
+    def test_small_landmark_motion_stays_forward(self) -> None:
+        yaw, pitch, _confidence = estimate_head_angles(self._landmarks(0.53), 1000, 800)
+        self.assertEqual(direction_from_angles(yaw, pitch), "forward")
+
+    def _landmarks_with_pitch(self, pitch_deg: float):
+        from types import SimpleNamespace
+
+        points = [SimpleNamespace(x=0.5, y=0.5, z=0.0) for _ in range(264)]
+        points[1] = SimpleNamespace(x=0.50, y=0.40 + (pitch_deg / 55.0) * 0.42, z=0.0)
+        points[152] = SimpleNamespace(x=0.50, y=0.82, z=0.0)
+        points[33] = SimpleNamespace(x=0.38, y=0.40, z=0.0)
+        points[263] = SimpleNamespace(x=0.62, y=0.40, z=0.0)
+        return points
+
+    def test_camera_neutral_pitch_is_calibrated_as_forward(self) -> None:
+        tracker = HeadPoseTracker(activate_hold_s=1.2, clear_hold_s=0.55)
+        neutral = self._landmarks_with_pitch(24.5)
+        for _ in range(10):
+            tracker.calibrate(neutral, 1000, 800)
+
+        observed = tracker.update(neutral, 1000, 800, 0.0)
+
+        self.assertTrue(tracker.calibrated)
+        self.assertAlmostEqual(observed.relative_pitch_deg, 0.0, places=3)
+        self.assertEqual(observed.direction, "forward")
+        self.assertFalse(observed.looking_away)
+
+    def test_relative_pitch_requires_persistence_and_clears(self) -> None:
+        tracker = HeadPoseTracker(activate_hold_s=1.2, clear_hold_s=0.55)
+        neutral = self._landmarks_with_pitch(24.5)
+        down = self._landmarks_with_pitch(34.5)
+        for _ in range(10):
+            tracker.calibrate(neutral, 1000, 800)
+
+        first = tracker.update(down, 1000, 800, 0.0)
+        held = tracker.update(down, 1000, 800, 1.0)
+        active = tracker.update(down, 1000, 800, 1.3)
+        self.assertAlmostEqual(active.relative_pitch_deg, 10.0, places=2)
+        self.assertEqual(first.direction, "forward")
+        self.assertEqual(held.direction, "forward")
+        self.assertEqual(active.direction, "down")
+
+        returned = tracker.update(neutral, 1000, 800, 1.4)
+        cleared = tracker.update(neutral, 1000, 800, 2.0)
+        self.assertEqual(returned.direction, "down")
+        self.assertEqual(cleared.direction, "forward")
+        self.assertFalse(cleared.looking_away)
+
+    def test_neutral_camera_pitch_produces_no_distraction(self) -> None:
+        tracker = HeadPoseTracker()
+        monitor = DistractionMonitor(head_tracker=tracker)
+        neutral = self._landmarks_with_pitch(24.5)
+        for _ in range(10):
+            tracker.calibrate(neutral, 1000, 800)
+
+        observation = monitor.update(neutral, 1000, 800, 0.0)
+
+        self.assertEqual(observation.head.direction, "forward")
+        self.assertFalse(observation.looking_down.active)
+        self.assertEqual(observation.distraction_risk, 0.0)
 
 
 class AttentionRiskContributionTests(unittest.TestCase):

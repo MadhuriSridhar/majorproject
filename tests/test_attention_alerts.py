@@ -57,7 +57,12 @@ class AttentionAlertBehaviorTests(unittest.TestCase):
             self.assertFalse(r.should_play_audio)
 
     def test_cooldown_works(self) -> None:
-        ctl = AlertEscalationController(warning_cooldown_s=10.0, warning_display_s=0.5)
+        ctl = AlertEscalationController(
+            warning_cooldown_s=10.0,
+            warning_display_s=0.5,
+            episode_recovery_s=0.0,
+            episode_cooldown_s=0.0,
+        )
         ctl.update("WARNING", 0.0)
         # Recover, then re-enter before cooldown elapses.
         ctl.update("NORMAL", 1.0)
@@ -106,9 +111,9 @@ class AttentionAlertBehaviorTests(unittest.TestCase):
 
     def test_volume_behavior_intact(self) -> None:
         settings = AudioSettings(alert_volume=0.35, alarm_volume=0.9, voice_enabled=True)
-        self.assertAlmostEqual(settings.master_volume, 0.35, places=5)
         backend = AudioBackend("DROWSY", None, settings)
-        self.assertAlmostEqual(backend._volume_for("DROWSY"), 0.35, places=5)
+        # DROWSY alarm uses alarm_volume; LOW_FATIGUE uses alert_volume.
+        self.assertAlmostEqual(backend._volume_for("DROWSY"), 0.9, places=5)
         self.assertAlmostEqual(backend._volume_for("LOW_FATIGUE"), 0.35, places=5)
 
 

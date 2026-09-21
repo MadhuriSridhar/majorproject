@@ -102,5 +102,34 @@ class EyeClosureTrackerTests(unittest.TestCase):
         self.assertEqual(self.tracker.blink_count, 1)
 
 
+class ColdStartBlinkRateTests(unittest.TestCase):
+    def _blink(self, tracker, start: float, duration: float = 0.3) -> None:
+        tracker.update(0.30, start - 0.05)
+        t = start
+        while t < start + duration:
+            tracker.update(0.10, t)
+            t += 0.05
+        tracker.update(0.30, start + duration)
+
+    def test_rate_uses_elapsed_time_during_first_minute(self) -> None:
+        tracker = EyeClosureTracker()
+        # Two blinks within the first 20 seconds of monitoring.
+        tracker.update(0.30, 0.0)  # marks monitoring start
+        self._blink(tracker, start=5.0)
+        self._blink(tracker, start=12.0)
+        state = tracker.update(0.30, 20.0)
+        # (2 blinks / 20s) * 60 = 6.0, not (2 / 60) * 60 = 2.0.
+        self.assertAlmostEqual(state.blink_rate, 6.0, places=4)
+
+    def test_rate_uses_full_window_after_minute(self) -> None:
+        tracker = EyeClosureTracker()
+        tracker.update(0.30, 0.0)
+        self._blink(tracker, start=5.0)
+        self._blink(tracker, start=12.0)
+        state = tracker.update(0.30, 73.0)
+        # Both blinks are older than the 60s window now -> zero in-window events.
+        self.assertEqual(state.blink_rate, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

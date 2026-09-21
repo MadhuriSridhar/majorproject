@@ -68,10 +68,12 @@ class YawnTracker:
         self._open_start_s: float | None = None
         self._yawn_counted_for_event = False
         self._yawn_timestamps: list[float] = []
+        self._monitoring_start_s: float | None = None
 
     def reset(self) -> None:
         self.yawn_count = 0
         self._yawn_timestamps.clear()
+        self._monitoring_start_s = None
         self._abort_open()
 
     def _abort_open(self) -> None:
@@ -84,7 +86,15 @@ class YawnTracker:
             return None
         cutoff = timestamp_s - window_s
         count = sum(1 for ts in self._yawn_timestamps if ts >= cutoff)
-        return (count / window_s) * 60.0 if window_s > 0 else float(count)
+        # Cold-start: while the session has been running for less than the full
+        # window, divide by the actual elapsed monitoring time instead of the
+        # full window so the displayed rate is not artificially low.
+        divisor = window_s
+        if self._monitoring_start_s is not None:
+            elapsed = timestamp_s - self._monitoring_start_s
+            if elapsed > 0.0:
+                divisor = min(window_s, elapsed)
+        return (count / divisor) * 60.0 if divisor > 0 else float(count)
 
     def _duration(self, timestamp_s: float) -> float:
         if self._open_start_s is None:
@@ -97,6 +107,9 @@ class YawnTracker:
 
         Returns the updated temporal state for UI display.
         """
+        if self._monitoring_start_s is None:
+            self._monitoring_start_s = timestamp_s
+
         if mar is None:
             self._abort_open()
             return TemporalMouthState(

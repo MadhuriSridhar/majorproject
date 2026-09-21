@@ -34,9 +34,20 @@ def build_summary_text(stats: SessionStats) -> str:
         f"End Time:              {end}",
         f"Driving Time:          {format_hms(stats.driving_duration_s)}",
         "",
-        f"Average Fatigue Risk:  {stats.average_fatigue_risk:.0f} / 100",
-        f"Maximum Fatigue Risk:  {stats.maximum_fatigue_risk:.0f} / 100",
+        f"Average Alertness:      {stats.average_alertness:.0f} / 100",
+        f"Minimum Alertness:      {stats.minimum_alertness:.0f} / 100",
+        f"Maximum Alertness:      {stats.maximum_alertness:.0f} / 100",
+        f"Average Fatigue Score:  {stats.average_fatigue_risk:.0f} / 100",
+        f"Maximum Fatigue Score:  {stats.maximum_fatigue_risk:.0f} / 100",
+        f"Average Fatigue Risk:   {stats.average_fatigue_risk:.0f} / 100",
+        f"Maximum Fatigue Risk:   {stats.maximum_fatigue_risk:.0f} / 100",
+        f"Average Distraction:    {stats.average_distraction:.0f} / 100",
+        f"Environmental Risk:     {stats.average_environmental_risk:.0f} / 100",
         f"Final Status:          {stats.final_status}",
+        f"Safe / Good Time:       {format_hms(stats.time_safe_s)}",
+        f"Moderate-Risk Time:     {format_hms(stats.time_moderate_s)}",
+        f"High-Risk Time:         {format_hms(stats.time_high_s)}",
+        f"Critical Time:          {format_hms(stats.time_critical_s)}",
         "",
         f"Total Blinks:          {stats.blink_count}",
         f"Average Blink Rate:    {stats.average_blink_rate:.1f} / min",
@@ -46,6 +57,12 @@ def build_summary_text(stats: SessionStats) -> str:
         f"Alert Events:          {stats.alert_count}",
         f"Warnings:              {stats.warning_count}",
         f"Drowsy Events:         {stats.drowsy_count}",
+        f"Alert Episodes:        {len(stats.alert_events)}",
+        f"Distraction Events:    {stats.distraction_event_count}",
+        f"Fatigue Events:        {stats.fatigue_event_count}",
+        f"Recovery Events:       {stats.recovery_event_count}",
+        f"High-Risk Zone Events: {stats.high_risk_zone_event_count}",
+        f"High-Risk Zone Exits:  {stats.zone_exit_event_count}",
         "",
         f"Night Context:         {night}",
         "",
@@ -137,7 +154,7 @@ def export_pdf(stats: SessionStats, output_dir: Path | None = None) -> Path:
     )
 
     story: list = []
-    story.append(Paragraph("DRIVER DROWSINESS MONITOR", title_style))
+    story.append(Paragraph("DRIVER ALERTNESS MONITOR", title_style))
     story.append(Paragraph("Session Report", heading_style))
     story.append(Spacer(1, 4))
 
@@ -148,8 +165,13 @@ def export_pdf(stats: SessionStats, output_dir: Path | None = None) -> Path:
         ["Start Time", start],
         ["End Time", end],
         ["Driving Duration", format_hms(stats.driving_duration_s)],
-        ["Average Fatigue Risk", f"{stats.average_fatigue_risk:.0f} / 100"],
-        ["Maximum Fatigue Risk", f"{stats.maximum_fatigue_risk:.0f} / 100"],
+        ["Average Alertness", f"{stats.average_alertness:.0f} / 100"],
+        ["Minimum Alertness", f"{stats.minimum_alertness:.0f} / 100"],
+        ["Maximum Alertness", f"{stats.maximum_alertness:.0f} / 100"],
+        ["Average Fatigue Score", f"{stats.average_fatigue_risk:.0f} / 100"],
+        ["Maximum Fatigue Score", f"{stats.maximum_fatigue_risk:.0f} / 100"],
+        ["Average Distraction", f"{stats.average_distraction:.0f} / 100"],
+        ["Environmental Risk", f"{stats.average_environmental_risk:.0f} / 100"],
         ["Final Status", stats.final_status],
         ["Total Blinks", str(stats.blink_count)],
         ["Average Blink Rate", f"{stats.average_blink_rate:.1f} / min"],
@@ -158,6 +180,12 @@ def export_pdf(stats: SessionStats, output_dir: Path | None = None) -> Path:
         ["Alert Events", str(stats.alert_count)],
         ["Warning Events", str(stats.warning_count)],
         ["Drowsy Events", str(stats.drowsy_count)],
+        ["Alert Episodes", str(len(stats.alert_events))],
+        ["Distraction Events", str(stats.distraction_event_count)],
+        ["Fatigue Events", str(stats.fatigue_event_count)],
+        ["Recovery Events", str(stats.recovery_event_count)],
+        ["High-Risk Zone Events", str(stats.high_risk_zone_event_count)],
+        ["High-Risk Zone Exits", str(stats.zone_exit_event_count)],
         ["Night Context", night],
     ]
     info_table = Table(info_rows, colWidths=[55 * mm, 100 * mm])
@@ -204,21 +232,45 @@ def export_pdf(stats: SessionStats, output_dir: Path | None = None) -> Path:
     story.append(factor_table)
     story.append(Spacer(1, 10))
 
-    # Risk trend (simple text representation if history exists).
-    if stats.risk_history:
-        story.append(Paragraph("Fatigue-Risk Trend (sampled)", heading_style))
+    # Alertness trend (simple text representation if history exists).
+    if stats.alertness_history:
+        story.append(Paragraph("Alertness Trend (sampled)", heading_style))
         # Downsample to at most 40 points for readability.
-        history = stats.risk_history
+        history = stats.alertness_history
         step = max(1, len(history) // 40)
         sampled = history[::step]
         trend_lines = []
         for sample in sampled:
-            risk = sample.risk if sample.risk is not None else 0.0
-            bar_len = int(round(risk / 5.0))
+            alertness = sample.alertness if sample.alertness is not None else 0.0
+            bar_len = int(round(alertness / 5.0))
             bar = "#" * bar_len
-            trend_lines.append(f"{sample.severity:<12} {risk:5.0f}  {bar}")
+            trend_lines.append(f"{sample.severity:<12} {alertness:5.0f}  {bar}")
         trend_text = "\n".join(trend_lines)
         story.append(Paragraph(trend_text.replace("\n", "<br/>"), body_style))
+
+    if stats.alert_events:
+        story.append(Paragraph("Alert Episodes", heading_style))
+        event_rows = [["Severity", "Primary Reason", "Minimum Alertness", "Action"]]
+        for event in stats.alert_events:
+            event_rows.append([
+                event.severity,
+                event.primary_reason or "Attention risk elevated",
+                f"{event.minimum_alertness:.0f}",
+                event.action or "Stay focused",
+            ])
+        event_table = Table(event_rows, colWidths=[28 * mm, 65 * mm, 32 * mm, 30 * mm])
+        event_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#16213e")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#c8d0dc")),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        story.append(event_table)
 
     doc.build(story)
     return pdf_path

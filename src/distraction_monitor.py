@@ -26,7 +26,7 @@ LOOK_DOWN_MIN_S = 1.8
 PASSENGER_MIN_S = 3.5
 
 # Extra hold after head-pose activates before a channel scores.
-CHANNEL_ACTIVATE_S = 0.40
+CHANNEL_ACTIVATE_S = 0.25
 CHANNEL_CLEAR_S = 0.50
 
 
@@ -51,6 +51,33 @@ class DistractionObservation:
     primary: str  # none | head_turn_left | head_turn_right | looking_down | passenger_side
     active: bool
     phone_available: bool = False  # always False — no phone model in repo
+    # Normalized conceptual distraction type (see classify_distraction_type).
+    distraction_type: str = "none"  # none | head_turn | downward | passenger_conversation
+    # Talking evidence is NOT available in this repo (no audio/speech + turn
+    # fusion), so these stay False by default. No fabricated talking detection.
+    talking_detected: bool = False
+    talking_available: bool = False
+
+
+def classify_distraction_type(primary: str | None, talking_detected: bool = False) -> str:
+    """Map a raw channel to a normalized distraction type.
+
+    - head_turn_left/right -> "head_turn" (sustained lateral/head-turn)
+    - looking_down        -> "downward"
+    - passenger_side      -> "passenger_conversation" only when real talking
+                             evidence exists; otherwise lateral "head_turn".
+
+    A passenger-side turn WITHOUT talking evidence is NOT "talking to the
+    passenger" — it is lateral / head-turn distraction.
+    """
+    name = (primary or "").lower()
+    if name in ("head_turn_left", "head_turn_right"):
+        return "head_turn"
+    if name == "looking_down":
+        return "downward"
+    if name == "passenger_side":
+        return "passenger_conversation" if talking_detected else "head_turn"
+    return "none"
 
 
 class _DurationChannel:
@@ -218,4 +245,7 @@ class DistractionMonitor:
             primary=primary,
             active=active,
             phone_available=False,
+            distraction_type=classify_distraction_type(primary),
+            talking_detected=False,
+            talking_available=False,
         )

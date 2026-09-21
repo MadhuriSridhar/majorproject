@@ -64,6 +64,14 @@ The following are **implemented** in this repository:
 - Session statistics
 - Session summary
 - PDF export
+- Driver distraction monitoring (head turn, looking down, passenger-side /
+  lateral-attention proxy) — head pose from the existing face landmarks
+- Attention engine (fuses fatigue + distraction + location + weather context)
+- Location context (GPS → IP fallback → cache; demo zones; configurable
+  geofences for real high-risk-zone classification)
+- Weather context (Open-Meteo, cached + failure-safe; precipitation,
+  visibility, wind, rain probability)
+- Context-aware alert severity (environment amplifies existing driver risk)
 - Automated tests (deterministic, no webcam required)
 
 ---
@@ -79,10 +87,11 @@ implemented:
 - Sunglasses detection
 - Eye-occlusion detection
 - Low-light enhancement / night vision
-- Head movement / head-pose detection
-- Weather context
+- Mobile-phone / hand-object detection (no phone/hand model is bundled)
+- Dashboard / knob interaction detection
+- Actual speech / passenger-talking detection (lateral head turn is only a
+  distraction *proxy*, not speech detection)
 - IR camera
-- GPS
 - CAN
 - OBD-II
 - Vehicle motion detection
@@ -116,10 +125,19 @@ Context Analysis  (time_context.py, driving_duration.py)
 Evidence Bridge  (evidence_bridge.py)
      |
      v
-Fatigue Engine  (fatigue_engine.py)  <--- authoritative decision-maker
+Fatigue Engine  (fatigue_engine.py)  <--- authoritative fatigue decision-maker
      |
      v
-FatigueDecision (risk, breakdown, severity, reasons)
+Head Pose / Distraction  (head_pose.py, distraction_monitor.py)
+     |
+     v
+Location / Weather Context  (location_context.py, weather_context.py)
+     |
+     v
+Attention Engine  (attention_engine.py)  <--- fuses all signals
+     |
+     v
+AttentionDecision (combined risk, level, alert severity, reasons)
      |
      v
 Alert Controller  (alert_escalation.py -> audio_engine.py)
@@ -128,10 +146,12 @@ Alert Controller  (alert_escalation.py -> audio_engine.py)
 UI / Audio / Session Summary
 ```
 
-**Authoritative decision-maker:** `FatigueEngine` is the only component that
-computes the risk score, factor breakdown, severity, and reasons. The UI, alert
-system, and session summary only *display* those values — none of them
-re-implement scoring.
+**Authoritative decision-makers:** `FatigueEngine` computes the fatigue risk
+score, factor breakdown, and reasons; `AttentionEngine` fuses fatigue,
+distraction, location, and weather context into the combined attention risk and
+the alert severity that actually drives escalation. The UI, alert system, and
+session summary only *display* those values — none of them re-implement
+scoring or connect individual sensors directly to audio.
 
 **One authoritative alert path:** `AlertEscalationController` + `AudioEngine`
 handle all alerts. Audio triggers once per severity state entry (never every
@@ -316,8 +336,10 @@ The dashboard (`src/app_ui.py`) is a professional Tkinter application.
 - **Driver metrics:** blinks, blink rate, yawns, yawn frequency, eye status,
   eye closure, fatigue risk, status.
 - **Risk:** TREND and TABLE risk-factor breakdown (Eye, Blink, Yawn, Night,
-  Driving Duration).
-- **Context:** current time, night context, driving duration.
+  Driving Duration), plus combined attention risk, distraction risk, location
+  and weather context.
+- **Context:** current time, night context, driving duration, location (GPS/IP/
+  demo/geofence) and weather.
 - **Bottom bar:** FPS, camera/system state.
 - **Session summary:** after STOP DRIVING (EXPORT PDF / NEW DRIVING SESSION /
   EXIT).
@@ -328,12 +350,17 @@ The dashboard (`src/app_ui.py`) is a professional Tkinter application.
 
 The Settings screen includes only supported options:
 
-- Alert volume
-- Alarm volume
+- Alert volume (independent of Alarm volume)
+- Alarm volume (independent of Alert volume)
 - Voice alerts (pyttsx3)
 - Visual alerts
 - Alarm sounds (enable/disable)
 - Predefined alarm selection (ALERT / WARNING / DROWSY)
+- Distraction monitoring (enable/disable)
+- Location risk (enable/disable)
+- Location mode (GPS / Automatic, Demo, Disabled)
+- Demo zone (for demo mode)
+- Weather monitoring (enable/disable)
 - Dashboard customization
 
 **Dashboard customization** lists only implemented components:
@@ -348,6 +375,8 @@ The Settings screen includes only supported options:
 - Driving Duration
 - Current Time
 - Night Context
+- Location / GPS
+- Weather
 - Camera FPS
 - Camera Status
 
@@ -375,10 +404,45 @@ counts, risk-factor breakdown, and a sampled risk trend.
 
 ---
 
+## 15a. Location / Weather Context
+
+- **Location flow:** Windows geolocation → IP fallback → cached coordinates.
+  A network/GPS failure never crashes the app and never blocks the camera loop
+  (context is fetched in a background worker).
+- **Location modes:** `GPS / Automatic`, `Demo` (controlled demo zones), and
+  `Disabled`. Demo zones are clearly labelled `DEMO`.
+- **Real high-risk zones:** configurable geofences in `config/geofences.json`
+  (latitude, longitude, radius, zone type, name, risk level). The dataset is
+  empty by default — the app never presents arbitrary coordinates as real
+  safety zones. See `config/geofences.example.json` for the schema.
+- **Populating the geofence file (OpenStreetMap / Overpass):** run
+  `python tools/build_geofences.py --south ... --west ... --north ... --east ...`
+  to copy already-mapped OpenStreetMap features into `config/geofences.json`
+  for a bounding box you choose. Default categories: `school` (school /
+  kindergarten / college / university) and `construction` (landuse/highway =
+  construction). `sharp_turn` / `highway` zones are **not** auto-generated
+  (OSM does not expose road-curve geometry as simple point features) — add such
+  zones manually with coordinates you verify. The script only copies mapped
+  data; it never invents zones.
+- **Empty geofence file = honest baseline.** With `config/geofences.json` empty
+  (or no matching zone), the UI shows **"No configured high-risk zone"** and
+  **"Location risk: Baseline"** — never a "verified safe road" claim.
+- **Zone entry/exit is an event, not a repeated message.** Remaining inside a
+  zone is one episode; the system emits a single entry event and a single exit
+  event (`ZoneTransitionTracker`), shown as a compact line in the UI and counted
+  in the session summary.
+- **Weather:** Open-Meteo (no API key), throttled and cached, with a safe
+  neutral fallback when unavailable. Precipitation, visibility, wind, and rain
+  probability are mapped to an environmental risk.
+- **Context is amplifying, not decisive:** location/weather *amplify* existing
+  driver risk. An attentive driver with clear weather stays low risk.
+
+---
+
 ## 16. Project Structure
 
 ```text
-majorproj/
+majorproject/
 ├── .gitignore
 ├── README.md
 ├── DEMO.md
@@ -387,6 +451,9 @@ majorproj/
 │   └── face_landmarker.task        # MediaPipe model (required)
 ├── assets/
 │   └── sounds/                     # generated predefined WAVs (git-ignored)
+├── config/
+│   ├── geofences.json              # optional real-world geofence dataset (empty)
+│   └── geofences.example.json      # documented example (placeholder coords)
 ├── src/
 │   ├── app_ui.py                   # Tkinter dashboard (main application entry)
 │   ├── drowsiness_demo.py          # OpenCV webcam monitor (alert escalation)
@@ -395,10 +462,15 @@ majorproj/
 │   ├── temporal_eye.py             # Blink / prolonged closure tracker
 │   ├── mouth_features.py           # MAR math
 │   ├── temporal_mouth.py           # Yawn tracker
+│   ├── head_pose.py                # head-pose estimation from face landmarks
+│   ├── distraction_monitor.py      # head-turn / look-down / passenger-side proxy
+│   ├── attention_engine.py         # fuses fatigue + distraction + context
 │   ├── time_context.py             # DAY / NIGHT context
 │   ├── driving_duration.py         # session timer + duration risk
 │   ├── evidence_bridge.py          # maps trackers/context -> FatigueEvidence
 │   ├── fatigue_engine.py           # authoritative rule-based fatigue engine
+│   ├── location_context.py         # GPS/IP/cache/demo/geofence location context
+│   ├── weather_context.py          # Open-Meteo weather context (cached)
 │   ├── alert_escalation.py         # 5-level alert state machine
 │   ├── audio_engine.py             # interruptible sound -> voice playback
 │   ├── predefined_sounds.py        # local sound synthesis + durations
@@ -410,19 +482,25 @@ majorproj/
 └── tests/
     ├── test_alert_escalation.py
     ├── test_alert_level.py         # 5-level alert system (ALERT severity)
+    ├── test_alert_stability.py     # warning persistence / ALERT hysteresis / gap
+    ├── test_attention_alerts.py
+    ├── test_attention_distraction.py
     ├── test_audio_engine.py
-    ├── test_audio_priority.py      # audio interruption / volume
+    ├── test_audio_priority.py      # audio interruption / independent volume
+    ├── test_context_aware_risk.py
     ├── test_dashboard_prefs.py
     ├── test_driving_duration.py
     ├── test_evidence_bridge.py
     ├── test_fatigue_engine.py
     ├── test_foundation_cleanup.py
     ├── test_foundation_engine.py
+    ├── test_location_context.py
     ├── test_session_manager.py
     ├── test_session_summary.py
     ├── test_temporal_eye.py
     ├── test_temporal_mouth.py
-    └── test_time_context.py
+    ├── test_time_context.py
+    └── test_weather_context.py
 ```
 
 ---
@@ -536,8 +614,9 @@ Run:
 python -m unittest discover -s tests -v
 ```
 
-The suite passes with the current test modules (140 foundational + 19 audio
-priority/volume + 16 alert-level tests = 175 tests).
+The suite passes with the current test modules (247 tests, including
+alert-stability, volume-independence, cold-start rate, geofence, and
+failure-safe location/weather coverage).
 
 ---
 
@@ -591,7 +670,55 @@ device.
 
 ## 24. Change Log
 
-**Current update — final alert escalation pass:**
+**Current update — down-gaze / face-loss separation:**
+
+- **Looking down is not fatigue:** `FatigueEngine` now suppresses eye-closure
+  fatigue evidence while the head is actively classified as looking down
+  (downward head orientation compresses the apparent eye opening / EAR). Downward
+  orientation still contributes as distraction via the existing `looking_down`
+  channel — never as a fatigue diagnosis.
+- **Face-loss grace period:** a brief landmark dropout (e.g. during a head turn)
+  keeps the last valid state for a short, time-based grace window and shows
+  "Face temporarily unavailable" instead of resetting the fatigue/attention
+  engines, recording no-face samples, or emitting a NORMAL/fatigue alert.
+  Prolonged absence still surfaces as monitoring-unavailable.
+- **Tests:** added `tests/test_face_loss_and_head_down.py`.
+
+**Previous update — GPS / weather / zone context audit + honest zone handling:**
+
+- **Honest empty-geofence wording:** with no configured/matching zone the UI now
+  reports "No configured high-risk zone" and "Location risk: Baseline" instead
+  of a neutral "Normal Road" label that could imply a verified-safe road.
+- **Zone entry/exit tracking:** `ZoneTransitionTracker` emits one entry event on
+  entering a configured zone and one exit event on leaving (no per-frame spam);
+  events are recorded in the session (entry + exit counts) and shown in the UI.
+- **Geofence population workflow:** added `tools/build_geofences.py`
+  (OpenStreetMap / Overpass) plus `docs/ARCHITECTURE.md` documenting the real
+  runtime flow.
+- **Context panel clipping fix:** the CONTEXT card no longer clips its content.
+- **Tests:** added `tests/test_zone_transitions.py` (zone entry/exit, honest
+  empty-geofence wording, geofence matching + malformed fallback, coordinates /
+  IP fallback passthrough, context reaching the attention engine).
+
+**Previous update — neuro-symbolic attention + stabilization pass:**
+
+- **Independent volumes restored:** `alert_volume` (LOW FATIGUE / ALERT sound +
+  voice) and `alarm_volume` (WARNING / DROWSY sound + voice) are separate
+  Settings sliders and persist independently.
+- **Cold-start rate fix:** blink/yawn rate use actual elapsed monitoring time
+  during the first window instead of dividing by the full 60 s.
+- **WARNING persistence:** HIGH attention risk must persist ~0.35 s before a
+  WARNING alert is emitted (single-frame spikes do not fire).
+- **ALERT hysteresis:** enter ALERT at risk ≥ 35, exit at ≤ 32 (no more
+  LOW FATIGUE ↔ ALERT flapping).
+- **Global audio gap:** ~2 s minimum between different alerts (higher-priority
+  escalation and DROWSY still interrupt immediately).
+- **Geofence classification:** configurable real high-risk zones via
+  `config/geofences.json` + haversine distance (demo zones preserved).
+- **Performance:** GPS/weather network work moved to a background worker so the
+  camera loop never blocks on HTTP.
+
+**Previous update — final alert escalation pass:**
 
 - **5-level alert system:** added the **ALERT** severity level between LOW
   FATIGUE and WARNING. Severity mapping: NORMAL (0–19), LOW FATIGUE (20–34),

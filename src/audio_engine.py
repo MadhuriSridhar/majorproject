@@ -17,10 +17,10 @@ Key behaviours:
   is length-limited to the configured duration (looping a short sound safely,
   stopping a long one early). The original asset file is never modified.
 - LOW FATIGUE includes a 2-second alarm before the spoken warning.
-- VOLUME: Settings volume (`alert_volume` / mirrored `alarm_volume`) controls
-  every voice and alarm playback for all severities. Changing volume applies to
-  subsequent alerts. Volume scaling is applied to PCM samples at runtime - the
-  original asset WAV files are never modified.
+- VOLUME: `alert_volume` controls the LOW_FATIGUE / ALERT alarm and voice
+  volume; `alarm_volume` controls the WARNING / DROWSY alarms and their voice.
+  Changing volume applies to subsequent alerts. Volume scaling is applied to
+  PCM samples at runtime - the original asset WAV files are never modified.
 - DURATION: alarm length is bounded to the configured duration
   (LOW_FATIGUE ~1s, ALERT ~1.5s, WARNING ~2.5s, DROWSY ~3.5s), safely looping
   a short sound when needed.
@@ -62,6 +62,58 @@ VOICE_MESSAGES: dict[str, str] = {
     "DROWSY": "Driver fatigue detected. Please take a safe break now.",
 }
 
+
+def build_voice_message(severity: str, reason: str | None = None, contributing_factors: tuple[str, ...] | list[str] | None = None) -> str:
+    """Return a severity-appropriate message based on the actual reason."""
+    if severity not in VOICE_MESSAGES:
+        return VOICE_MESSAGES.get("ALERT", "Please stay alert.")
+    if not reason:
+        return VOICE_MESSAGES[severity]
+
+    details = (reason or "").strip()
+    low = details.lower()
+    if severity == "DROWSY":
+        if "closure" in low or "eye" in low:
+            return "Critical warning. Prolonged eye closure is reducing your alertness. Please take a safe stop now."
+        if "road" in low or "head" in low or "gaze" in low or "away" in low:
+            return "Critical warning. You have been looking away from the road for too long. Please focus on the road and take a safe stop."
+        if "weather" in low:
+            return "Critical warning. Attention risk is elevated because of poor weather conditions. Please drive carefully and take a safe stop."
+        if "location" in low or "zone" in low:
+            return "Critical warning. Road conditions ahead are increasing your risk. Please slow down and stay focused."
+        if "yawn" in low:
+            return "Critical warning. Your alertness is dangerously low due to repeated yawning. Please take a safe stop now."
+        return "Critical warning. Your alertness is dangerously low due to the current driving conditions. Please take a safe stop now."
+    if severity == "WARNING":
+        if "closure" in low or "eye" in low:
+            return "Warning. Prolonged eye closure is reducing your alertness. Please stay focused and consider taking a safe break."
+        if "road" in low or "head" in low or "gaze" in low or "away" in low:
+            return "Warning. You have been looking away from the road for too long. Please focus on the road."
+        if "yawn" in low:
+            return "Warning. Your alertness is decreasing due to repeated yawning. Please stay attentive."
+        if "weather" in low:
+            return "Warning. Attention risk is elevated because of poor weather conditions. Please drive carefully."
+        return "Warning. Your attention is degrading. Please stay focused and consider a short break."
+    if severity == "ALERT":
+        if "closure" in low or "eye" in low:
+            return "Attention warning. Prolonged eye closure is reducing your alertness. Please stay focused."
+        if "road" in low or "head" in low or "gaze" in low or "away" in low:
+            return "Attention warning. Your attention is drifting away from the road. Please look forward."
+        if "yawn" in low:
+            return "Attention warning. Repeated yawning is reducing your alertness. Please stay attentive."
+        if "weather" in low:
+            return "Attention warning. Poor weather is increasing your attention risk. Please drive carefully."
+        return "Your alertness appears to be decreasing. Please stay attentive."
+    if severity == "LOW_FATIGUE":
+        if "road" in low or "away" in low:
+            return "Please stay focused on the road."
+        if "eye" in low or "closure" in low:
+            return "Please keep your eyes on the road and stay alert."
+        if "weather" in low:
+            return "Weather conditions are adding risk. Please stay alert and drive carefully."
+        return "Please stay alert."
+    return VOICE_MESSAGES[severity]
+
 # Default sound selection per severity (driver can change in Settings).
 DEFAULT_SOUNDS: dict[str, str] = {
     "LOW_FATIGUE": "soft_beep_2",
@@ -73,24 +125,31 @@ DEFAULT_SOUNDS: dict[str, str] = {
 # Severity priority (higher wins).
 _SEVERITY_PRIORITY = {"NORMAL": 0, "LOW_FATIGUE": 1, "ALERT": 2, "WARNING": 3, "DROWSY": 4}
 
+# Central, single voice volume for ALL spoken warnings. This is intentionally
+# separate from the alarm (WAV) volumes so that every voice message has the
+# same perceived loudness regardless of severity/category.
+VOICE_VOLUME = 0.85
+
 
 @dataclass(frozen=True)
 class AudioSettings:
-    """Snapshot of current audio settings used by the engine."""
+    """Snapshot of current audio settings used by the engine.
 
-    # Both keys are kept for Settings compatibility; playback uses one volume.
-    alert_volume: float = 0.6  # 0.0 .. 1.0 -> all voice + alarm playback
-    alarm_volume: float = 0.6  # mirrored legacy key (same effective volume)
+    ``alert_volume`` / ``alarm_volume`` control the alarm *sounds* (WAV beeps):
+    - ``alert_volume``  -> LOW_FATIGUE / ALERT alarm sound.
+    - ``alarm_volume``  -> WARNING / DROWSY alarm sound.
+    ``voice_volume`` is a single, shared volume for every spoken TTS warning so
+    no message is unexpectedly quieter or louder than another.
+    """
+
+    alert_volume: float = 0.6  # 0.0 .. 1.0 -> LOW_FATIGUE / ALERT alarm sound
+    alarm_volume: float = 0.7  # 0.0 .. 1.0 -> WARNING / DROWSY alarm sound
+    voice_volume: float = VOICE_VOLUME  # 0.0 .. 1.0 -> every spoken warning
     voice_enabled: bool = True
     sound_enabled: bool = True
     alert_sound: str = "soft_beep_2"
     warning_sound: str = "warning_1"
     drowsy_sound: str = "strong_alarm_1"
-
-    @property
-    def master_volume(self) -> float:
-        """Single 0..1 volume applied to every voice and alarm playback."""
-        return max(0.0, min(1.0, float(self.alert_volume)))
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +226,9 @@ class AudioBackend(threading.Thread):
         settings: AudioSettings,
         on_error: callable | None = None,
         on_done: callable | None = None,
+        reason: str | None = None,
+        contributing_factors: tuple[str, ...] | list[str] | None = None,
+        generation: int = 0,
     ) -> None:
         super().__init__(name=f"audio-{severity}", daemon=True)
         self.severity = severity
@@ -174,7 +236,11 @@ class AudioBackend(threading.Thread):
         self.settings = settings
         self.on_error = on_error
         self.on_done = on_done
+        self.reason = reason or ""
+        self.contributing_factors = tuple(contributing_factors or ())
+        self.generation = int(generation)
         self.interrupted = threading.Event()
+        self._alarm_finished = threading.Event()
         self._sound_interrupted = False
         self._voice_interrupted = False
 
@@ -183,8 +249,10 @@ class AudioBackend(threading.Thread):
     # ------------------------------------------------------------------
 
     def _volume_for(self, severity: str) -> float:
-        """Settings master volume for every severity (voice and alarm)."""
-        return self.settings.master_volume
+        """Alert volume for LOW_FATIGUE / ALERT; alarm volume for WARNING/DROWSY."""
+        if severity in ("LOW_FATIGUE", "ALERT"):
+            return max(0.0, min(1.0, float(self.settings.alert_volume)))
+        return max(0.0, min(1.0, float(self.settings.alarm_volume)))
 
     def _required_duration(self) -> float:
         """Configured alarm duration (seconds) for this severity."""
@@ -310,7 +378,7 @@ class AudioBackend(threading.Thread):
             print(f"AUDIO: {self.severity}")
             print(f"Voice: ENABLED")
             engine = pyttsx3.init()
-            volume = self._volume_for(self.severity)
+            volume = max(0.0, min(1.0, float(self.settings.voice_volume)))
             try:
                 engine.setProperty("volume", volume)
             except Exception:
@@ -368,14 +436,26 @@ class AudioBackend(threading.Thread):
                 and self._required_duration() > 0.0
             ):
                 print("AUDIO PLAYBACK STARTED")
-                self._play_wav(self.wav_path)
-                print("ALARM FINISHED")
+                self._alarm_finished.clear()
+                try:
+                    self._play_wav(self.wav_path)
+                finally:
+                    # _play_wav returns only after the winsound playback
+                    # window has completed or the alarm was interrupted.
+                    self._alarm_finished.set()
+                self._alarm_finished.wait()
+                if not self._sound_interrupted:
+                    print("ALARM FINISHED")
                 played = True
 
             if self.interrupted.is_set() or self._sound_interrupted:
                 return
 
-            message = VOICE_MESSAGES.get(self.severity, "")
+            message = build_voice_message(
+                self.severity,
+                self.reason,
+                self.contributing_factors,
+            )
             if message and self.settings.voice_enabled:
                 if not self.interrupted.is_set():
                     print("STARTING VOICE")
@@ -412,6 +492,7 @@ class AudioEngine:
         self._current: AudioBackend | None = None
         self._active_severity: str | None = None
         self._last_error: str | None = None
+        self._generation = 0
         # Generate sounds on startup (best effort).
         try:
             ensure_sounds_generated()
@@ -438,13 +519,22 @@ class AudioEngine:
             return self.settings.drowsy_sound
         return ""
 
-    def _on_job_done(self, severity: str) -> None:
+    def _on_job_done(self, severity: str, generation: int | None = None) -> None:
         """A playback job finished naturally - release its priority slot."""
         with self._lock:
-            if self._active_severity == severity:
+            current = self._current
+            if (
+                self._active_severity == severity
+                and (generation is None or current is None or current.generation == generation)
+            ):
                 self._active_severity = None
 
-    def play_alert(self, severity: str) -> None:
+    def play_alert(
+        self,
+        severity: str,
+        reason: str | None = None,
+        contributing_factors: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
         """
         Start the sound -> voice sequence for the given severity.
 
@@ -453,7 +543,7 @@ class AudioEngine:
         it can play immediately. Audio is never re-triggered every frame - the
         alert escalation controller decides when to call this (on state entry).
         """
-        if severity not in self.PRIORITY:
+        if severity not in self.PRIORITY or severity == "NORMAL":
             return
         with self._lock:
             # Priority guard: a lower-priority alert must never preempt a
@@ -474,11 +564,20 @@ class AudioEngine:
                 return
 
             if current is not None and current.is_alive():
-                # Stop the current alarm so the new
-                # higher-priority alert takes over immediately, and prevent its
-                # voice from being spoken.
                 current.interrupted.set()
 
+        # Do not let the replacement thread overlap the interrupted sequence.
+        # Joining outside the lock avoids deadlocking its completion callback.
+        if current is not None and current.is_alive():
+            current.join(timeout=2.0)
+            if current.is_alive():
+                # A stuck backend is safer to suppress than to overlap with a
+                # second alarm/voice sequence.
+                return
+
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
             self._active_severity = severity
             wav = sound_path(self._sound_for(severity))
             job = AudioBackend(
@@ -486,7 +585,10 @@ class AudioEngine:
                 wav_path=wav,
                 settings=self.settings,
                 on_error=self._record_error,
-                on_done=self._on_job_done,
+                on_done=lambda completed, token=generation: self._on_job_done(completed, token),
+                reason=reason,
+                contributing_factors=contributing_factors,
+                generation=generation,
             )
             self._current = job
             job.start()
@@ -503,6 +605,7 @@ class AudioEngine:
             self._active_severity = None
         if current is not None:
             current.interrupted.set()
+            current.join(timeout=2.0)
 
     def shutdown(self) -> None:
         self.interrupt_all()
