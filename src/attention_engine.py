@@ -65,6 +65,15 @@ MODERATE_MAX = 49
 HIGH_MAX = 74
 # >= HIGH_MAX+ → CRITICAL
 
+# A reduced-attention band is only eligible for a lightweight caution when
+# environmental context is significant. It never turns ordinary 75-89
+# alertness into a continuous alert.
+CAUTION_ALERTNESS_MIN = 75.0
+CAUTION_ALERTNESS_MAX = 89.0
+CAUTION_WEATHER_RISK = 60.0
+CAUTION_NIGHT_RISK = 20.0
+CAUTION_ZONE_RISK = 55.0
+
 # ALERT sits inside the MODERATE band. Enter ALERT at ALERT_ENTRY, but do not
 # immediately drop back to LOW_FATIGUE just below it: use a lower exit
 # threshold (hysteresis) so LOW_FATIGUE <-> ALERT flapping is avoided.
@@ -841,6 +850,20 @@ class AttentionEngine:
             alertness_score = max(0.0, min(100.0, 100.0 - float(smoothed)))
         else:
             alertness_score = 100.0
+
+        contextual_caution = (
+            alert == "NORMAL"
+            and CAUTION_ALERTNESS_MIN <= alertness_score <= CAUTION_ALERTNESS_MAX
+            and (
+                wx >= CAUTION_WEATHER_RISK
+                or (carla_time_risk >= CAUTION_NIGHT_RISK and wx >= 35.0)
+                or loc >= CAUTION_ZONE_RISK
+            )
+        )
+        if contextual_caution:
+            alert = "LOW_FATIGUE"
+            if reason == "Attentive":
+                reason = "Reduced attention in significant driving context"
 
         safe_stop = level == "CRITICAL"
         recommendation = (

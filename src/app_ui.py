@@ -19,6 +19,7 @@ import os
 import threading
 import time
 import tkinter as tk
+from dataclasses import replace
 from tkinter import messagebox, ttk
 
 import cv2
@@ -154,6 +155,9 @@ def format_carla_context(context: dict | None) -> dict[str, str]:
             "weather": "--",
             "time": "--",
             "session": "--",
+            "carla_zone": "--",
+            "carla_position": "--",
+            "zone_risk": "--",
         }
 
     weather = snapshot.get("weather") or {}
@@ -200,6 +204,7 @@ def format_carla_context(context: dict | None) -> dict[str, str]:
 # its last valid state and shows "temporarily unavailable" instead of treating
 # the loss as monitoring shutdown or fatigue. Time-based (not frame-count based).
 FACE_LOSS_GRACE_S = 1.5
+MAX_RENDERED_HISTORY_POINTS = 600
 
 
 def create_optional_carla_context():
@@ -485,9 +490,13 @@ class CameraWorker(threading.Thread):
             round(float(values["smoothed_attention_risk"] or 0.0), 1),
             values["primary_alert_reason"],
         )
-        should_log = signature != self._last_diagnostic_signature
-        if self._last_diagnostic_log_s is None or now_s - self._last_diagnostic_log_s >= 2.0:
-            should_log = True
+        should_log = (
+            signature != self._last_diagnostic_signature
+            and (
+                self._last_diagnostic_log_s is None
+                or now_s - self._last_diagnostic_log_s >= 2.0
+            )
+        )
         if should_log:
             print(f"DIAGNOSTICS: {values}")
             self._last_diagnostic_signature = signature
@@ -683,8 +692,6 @@ class CameraWorker(threading.Thread):
                 eyes_not_visible = bool(head_down or head_turned)
                 mouth_not_visible = bool(head_down or head_turned)
 
-                time_ctx = get_time_context()
-
                 # Location / weather: published by the background context worker.
                 # The camera loop never performs network I/O here, so GPS/HTTP
                 # failures or delays can never stall the real-time pipeline.
@@ -692,14 +699,37 @@ class CameraWorker(threading.Thread):
                     location_ctx = self._location_ctx
                     weather_ctx = self._weather_ctx
                     carla_ctx = dict(self._carla_ctx)
+                time_ctx = get_time_context()
+                carla_period = str((carla_ctx.get("time") or {}).get("period") or "")
+                if carla_ctx.get("carla_connected") and carla_period in {"DAY", "NIGHT"}:
+                    time_ctx = replace(
+                        time_ctx,
+                        context=carla_period,
+                        night_context_active=carla_period == "NIGHT",
+                    )
                 if location_ctx is None:
                     location_ctx = self.location_provider._unavailable("Unavailable")
                 if weather_ctx is None:
                     weather_ctx = self.weather_provider._unavailable("Unavailable")
 
+                # CARLA is the authoritative zone source when connected.
+                # The regular location provider remains available for the
+                # non-CARLA context panel and real-world mode.
+                carla_location = carla_ctx.get("location") or {}
+                active_zone_type = (
+                    str(carla_location.get("zone_type") or "none")
+                    if carla_ctx.get("carla_connected")
+                    else str(location_ctx.zone_type or "none")
+                )
+                active_zone_name = (
+                    str(carla_location.get("zone_name") or "Normal Road")
+                    if carla_ctx.get("carla_connected")
+                    else location_ctx.zone_name
+                )
+
                 # Zone entry/exit tracking (event semantics, never per frame).
                 zone_transition = self.zone_tracker.update(
-                    location_ctx.zone_type, location_ctx.zone_name, now
+                    active_zone_type, active_zone_name, now
                 )
                 if zone_transition is not None:
                     self._last_zone_event_text = format_zone_event_summary(zone_transition)
@@ -907,6 +937,12 @@ class CameraWorker(threading.Thread):
             self.join(timeout=0.5)
         except Exception:
             pass
+        context_thread = self._context_thread
+        if context_thread is not None and context_thread is not threading.current_thread():
+            try:
+                context_thread.join(timeout=0.5)
+            except Exception:
+                pass
 
 
 class CustomDashboardDialog(tk.Toplevel):
@@ -2269,11 +2305,17 @@ class DrowsinessApp(tk.Tk):
         if self.ctx_carla_time is not None:
             self.ctx_carla_time.configure(text=f"Time: {carla_display['time']}")
         if self.ctx_carla_zone is not None:
-            self.ctx_carla_zone.configure(text=f"CARLA Zone: {carla_display['carla_zone']}")
+            self.ctx_carla_zone.configure(
+                text=f"CARLA Zone: {carla_display.get('carla_zone', '--')}"
+            )
         if self.ctx_carla_position is not None:
-            self.ctx_carla_position.configure(text=f"CARLA Position: {carla_display['carla_position']}")
+            self.ctx_carla_position.configure(
+                text=f"CARLA Position: {carla_display.get('carla_position', '--')}"
+            )
         if self.ctx_carla_zone_risk is not None:
-            self.ctx_carla_zone_risk.configure(text=f"Zone Risk: {carla_display['zone_risk']}")
+            self.ctx_carla_zone_risk.configure(
+                text=f"Zone Risk: {carla_display.get('zone_risk', '--')}"
+            )
         if self.ctx_carla_session is not None:
             self.ctx_carla_session.configure(text=f"Driving Session: {carla_display['session']}")
         if getattr(self, "ctx_zone_event", None) is not None:
@@ -2591,14 +2633,28 @@ class DrowsinessApp(tk.Tk):
             self.trend_canvas.create_text(10, 34, anchor="nw", text="CALIBRATING / COLLECTING DATA...", fill=FG_MUTED, font=FONT_BODY)
             return
 
+        # Keep canvas work bounded as a session grows. The complete history
+        # remains available to the session model; only the visual rendering is
+        # evenly downsampled so Tk never has to recreate thousands of objects
+        # on the UI thread.
+        if len(history) > MAX_RENDERED_HISTORY_POINTS:
+            last_index = len(history) - 1
+            step = last_index / (MAX_RENDERED_HISTORY_POINTS - 1)
+            render_history = [
+                history[round(index * step)]
+                for index in range(MAX_RENDERED_HISTORY_POINTS)
+            ]
+        else:
+            render_history = history
+
         cw = max(180, self.trend_canvas.winfo_width() or 400)
         ch = max(60, int(self.trend_canvas.cget("height")) or 150)
         left = 46
         top = 30
         width = max(120, cw - left - 16)
         height = max(40, ch - top - 34)
-        start = history[0].timestamp_s
-        span = max(1.0, history[-1].timestamp_s - start)
+        start = render_history[0].timestamp_s
+        span = max(1.0, render_history[-1].timestamp_s - start)
 
         def _x(ts: float) -> float:
             return left + ((ts - start) / span) * width
@@ -2642,7 +2698,7 @@ class DrowsinessApp(tk.Tk):
         # Draw each series as broken lines (None breaks).
         for _label, key, color, width_l in series:
             pts: list[tuple[float, float]] = []
-            for sample in history:
+            for sample in render_history:
                 val = getattr(sample, key, None)
                 if val is None:
                     pts = []

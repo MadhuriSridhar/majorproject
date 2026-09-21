@@ -142,6 +142,9 @@ class CarlaContextDisplayTests(unittest.TestCase):
                 "weather": "--",
                 "time": "--",
                 "session": "--",
+                "carla_zone": "--",
+                "carla_position": "--",
+                "zone_risk": "--",
             },
         )
 

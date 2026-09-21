@@ -119,7 +119,6 @@ CARLA_SIM_ZONES: tuple[CarlaZone, ...] = (
     CarlaZone("Pedestrian Zone", "pedestrian", -170.0, -35.0, 25.0, 95.0, 65.0),
     CarlaZone("Highway", "highway", 50.0, 170.0, -170.0, -60.0, 40.0),
     CarlaZone("Sharp Turn / High-Risk Zone", "sharp_turn", -60.0, 30.0, -170.0, -80.0, 65.0),
-    CarlaZone("Other Road", "other", -200.0, 200.0, -200.0, 200.0, 25.0),
 )
 
 _CANONICAL_ZONE_ALIASES: dict[str, str] = {
@@ -155,10 +154,13 @@ def classify_carla_zone(
     except (TypeError, ValueError):
         return "none", "Normal Road", BASELINE_LOCATION_RISK
 
+    # Other Road is the explicit CARLA fallback, not a competing catch-all
+    # geofence. Configured semantic zones below therefore always win.
+
     for zone in zones if zones is not None else CARLA_SIM_ZONES:
         if zone.contains(world_x, world_y):
             return zone.zone_type, zone.name, float(zone.risk_level)
-    return "none", "Normal Road", BASELINE_LOCATION_RISK
+    return "other", "Other Road", 25.0
 
 
 def carla_sim_location_context(

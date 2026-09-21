@@ -240,6 +240,7 @@ class AudioBackend(threading.Thread):
         self.contributing_factors = tuple(contributing_factors or ())
         self.generation = int(generation)
         self.interrupted = threading.Event()
+        self._alarm_finished = threading.Event()
         self._sound_interrupted = False
         self._voice_interrupted = False
 
@@ -435,8 +436,16 @@ class AudioBackend(threading.Thread):
                 and self._required_duration() > 0.0
             ):
                 print("AUDIO PLAYBACK STARTED")
-                self._play_wav(self.wav_path)
-                print("ALARM FINISHED")
+                self._alarm_finished.clear()
+                try:
+                    self._play_wav(self.wav_path)
+                finally:
+                    # _play_wav returns only after the winsound playback
+                    # window has completed or the alarm was interrupted.
+                    self._alarm_finished.set()
+                self._alarm_finished.wait()
+                if not self._sound_interrupted:
+                    print("ALARM FINISHED")
                 played = True
 
             if self.interrupted.is_set() or self._sound_interrupted:
