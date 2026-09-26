@@ -1,0 +1,56 @@
+{
+  "dataset_path": "C:\\Users\\samud\\Desktop\\MAJOR_PROJECT\\datasets\\UTA-RLDD\\test",
+  "test_path": "C:\\Users\\samud\\Desktop\\MAJOR_PROJECT\\datasets\\UTA-RLDD\\test",
+  "total_videos": 909,
+  "active_videos": 456,
+  "fatigue_videos": 453,
+  "correctly_classified": 456,
+  "incorrectly_classified": 451,
+  "insufficient_data_videos": 2,
+  "accuracy": 0.5027563395810364,
+  "precision": 0.5027563395810364,
+  "recall": 1.0,
+  "f1_score": 0.669112252384446,
+  "confusion_matrix": {
+    "labels": [
+      "ACTIVE",
+      "FATIGUE"
+    ],
+    "matrix": [
+      [
+        456,
+        0
+      ],
+      [
+        451,
+        0
+      ]
+    ]
+  },
+  "class_mapping": {
+    "SYSTEM": {
+      "NORMAL": "ACTIVE",
+      "SAFE": "ACTIVE",
+      "LOW_FATIGUE": "FATIGUE",
+      "ALERT": "FATIGUE",
+      "WARNING": "FATIGUE",
+      "DROWSY": "FATIGUE"
+    },
+    "dataset": {
+      "ACTIVE": "ACTIVE",
+      "FATIGUE": "FATIGUE"
+    }
+  },
+  "per_class": {
+    "ACTIVE": {
+      "precision": 0.5027563395810364,
+      "recall": 1.0,
+      "f1": 0.669112252384446
+    },
+    "FATIGUE": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0
+    }
+  }
+}

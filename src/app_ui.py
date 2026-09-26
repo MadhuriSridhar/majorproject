@@ -770,16 +770,17 @@ class CameraWorker(threading.Thread):
                         else float(decision.fatigue_score or 0)
                     )
                     attention = self.attention_engine.update(
-                        fatigue_risk=fatigue_risk,
-                        distraction=distraction_obs if self.distraction_enabled else None,
-                        now_s=now,
-                        face_ok=True,
-                        location_risk=loc_risk,
-                        weather_risk=wx_risk,
-                        location_zone=str(location_ctx.zone_type or "none"),
-                        weather_condition=str(weather_ctx.weather_condition or "unknown"),
-                        carla_context=carla_ctx,
-                    )
+                    fatigue_risk=fatigue_risk,
+                    distraction=distraction_obs if self.distraction_enabled else None,
+                    now_s=now,
+                    face_ok=True,
+                    location_risk=loc_risk,
+                    weather_risk=wx_risk,
+                    location_zone=str(location_ctx.zone_type or "none"),
+                    weather_condition=str(weather_ctx.weather_condition or "unknown"),
+                    carla_context=carla_ctx,
+                    fatigue_status=str(decision.status or "SAFE"),
+                )
                     # Alerts follow combined attention severity, but the live
                     # reason and score remain available to the single escalation
                     # controller so the UI and audio speak the true cause.
