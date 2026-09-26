@@ -1,0 +1,49 @@
+{
+  "dataset": "YawDD",
+  "dataset_path": "C:\\Users\\samud\\Desktop\\MAJOR_PROJECT\\datasets\\YawDD",
+  "evaluation_task": "YAWNING vs NON_YAWNING",
+  "label_mapping": {
+    "YAWNING": "Yawning and Talking&Yawning filename conditions",
+    "NON_YAWNING": "Normal and Talking filename conditions"
+  },
+  "videos_evaluated": 320,
+  "videos_failed": 0,
+  "source_condition_counts": {
+    "NORMAL": 105,
+    "TALKING": 100,
+    "TALKING_YAWNING": 13,
+    "YAWNING": 102
+  },
+  "total_frames": 223581,
+  "processed_frames": 223581,
+  "valid_frames": 222035,
+  "invalid_or_face_missing_frames": 1546,
+  "metrics": {
+    "labels": [
+      "NON_YAWNING",
+      "YAWNING"
+    ],
+    "matrix": [
+      [
+        205,
+        0
+      ],
+      [
+        17,
+        98
+      ]
+    ],
+    "usable_videos": 320,
+    "correct": 303,
+    "incorrect": 17,
+    "insufficient_data": 0,
+    "accuracy": 94.6875,
+    "precision": 100.0,
+    "recall": 85.21739130434783,
+    "f1_score": 92.01877934272301
+  },
+  "dash_videos_excluded_from_video_metrics": 29,
+  "unlabeled_mirror_videos_excluded": 0,
+  "errors": [],
+  "production_logic_changed": false
+}
